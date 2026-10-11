@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
+from itertools import combinations
 import json
 from pathlib import Path
 import random
@@ -19,7 +20,8 @@ from urllib.request import urlopen
 from pydantic import TypeAdapter
 
 from model_api import call_model, response_text
-from likelihood import compute_saved_losses
+from likelihood import LAMBDA_A, compute_saved_losses
+from topo_sort import topological_sort
 from schemas import (
     DatasetRow, IntermediatePreference, Judgment, Prompts,
     QuestionRecord, ScoringRequest, SystemPreference,
@@ -152,11 +154,8 @@ def judge_pair(output_dir, row: DatasetRow, first, second, stage, first_id, seco
     ], temperature=0, max_tokens=512, json_output=True)
 
     decision = TypeAdapter(Judgment).validate_json(raw)
-    if decision.choice == "duplicate":
-        raise ValueError("Duplicate detection is local, not a judge label")
-
     decision.presented_order = order
-    decision.winner = order[int(decision.choice) - 1] if decision.choice in ("1", "2") else None
+    decision.winner = order[0] if decision.choice == "option1" else order[1] if decision.choice == "option2" else None
     return decision
 
 
@@ -165,7 +164,7 @@ def process_question(output_dir, row: DatasetRow, prompts: Prompts, max_tokens) 
     record = QuestionRecord(id=row.id, x=row.question, system=row.system,
                             z_chosen=row.chosen, z_rejected=row.rejected, a_messages=prompt)
 
-    for name in ("y1", "y2"):
+    for name in ("y1", "y2", "y3"):
         try:
             setattr(record, name, recorded_call(output_dir, row.id, name, GENERATOR, prompt,
                                                 temperature=0.3, max_tokens=max_tokens))
@@ -175,24 +174,42 @@ def process_question(output_dir, row: DatasetRow, prompts: Prompts, max_tokens) 
         except Exception as error:
             record.errors.append({"stage": name, "error": type(error).__name__ + ": " + str(error)})
 
-    complete = all(record.finish_reasons.get(name) == "stop" for name in ("y1", "y2"))
+    candidates = {"y1": record.y1, "y2": record.y2, "y3": record.y3}
+    complete = all(record.finish_reasons.get(name) == "stop" for name in candidates)
     if complete:
-        try:
-            if record.y1.strip() == record.y2.strip():
-                record.intermediate_judgment = Judgment(choice="duplicate", confidence=0, reason="Identical candidates")
-            else:
-                record.intermediate_judgment = judge_pair(
-                    output_dir, row, record.y1, record.y2, "judge_y", "y1", "y2", prompts
-                )
-        except Exception as error:
-            record.errors.append({"stage": "judge_y", "error": type(error).__name__ + ": " + str(error)})
+        for first, second in combinations(candidates, 2):
+            stage = f"judge_{first}_{second}"
+            try:
+                if candidates[first].strip() == candidates[second].strip():
+                    record.discard_reason = "duplicate"
+                    decision = Judgment(choice="tie")
+                else:
+                    decision = judge_pair(output_dir, row, candidates[first], candidates[second],
+                                          stage, first, second, prompts)
+                record.intermediate_judgments.append(decision)
+                if not decision.winner:
+                    record.discard_reason = record.discard_reason or decision.choice
+                    break
+                loser = second if decision.winner == first else first
+                record.preference_edges.append((decision.winner, loser))
+            except Exception as error:
+                record.errors.append({"stage": stage, "error": type(error).__name__ + ": " + str(error)})
+                break
+
+        if len(record.preference_edges) == 3:
+            record.comparisons_accepted = topological_sort(record.preference_edges)
+            if not record.comparisons_accepted:
+                record.discard_reason = "cyclic preferences"
+        else:
+            record.discard_reason = record.discard_reason or "incomplete strict comparisons"
 
     # No final generation or final judge: B teacher-forces dataset zc/zr instead.
     if complete:
         record.scoring_request = ScoringRequest(
-            id=row.id, a_messages=prompt, intermediates=[record.y1, record.y2],
-            b_messages=[model_messages(row, prompts, prompts.b_instruction, y) for y in (record.y1, record.y2)],
-            final_answers=[row.chosen, row.rejected], candidate_mask=[True, record.y1 != record.y2])
+            id=row.id, a_messages=prompt, intermediates=list(candidates.values()),
+            b_messages=[model_messages(row, prompts, prompts.b_instruction, y) for y in candidates.values()],
+            final_answers=[row.chosen, row.rejected],
+            candidate_mask=[y not in list(candidates.values())[:i] for i, y in enumerate(candidates.values())])
 
     save_json(output_dir / f"question_{row.id}.json", record)
     return record
@@ -234,8 +251,9 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "calls").mkdir(exist_ok=True)
 
-    config = {"workflow_version": 6, "questions": args.questions, "max_tokens": args.max_tokens,
+    config = {"workflow_version": 8, "questions": args.questions, "max_tokens": args.max_tokens,
               "generation_temperature": 0.3,
+              "lambda_A": LAMBDA_A,
               "prompts": asdict(prompts), "generator": GENERATOR, "judge": JUDGE}
     config_path = args.output_dir / "run_config.json"
     if config_path.exists():
@@ -251,9 +269,9 @@ def main():
     save_json(args.output_dir / "system_preferences.json", system_batch)
 
     print("***** Running SysDPO-Sampling collection smoke *****", flush=True)
-    print(f"  Num examples = {len(rows)}; Collection rounds = 1; Intermediate samples = 2", flush=True)
+    print(f"  Num examples = {len(rows)}; Collection rounds = 1; Intermediate samples = 3", flush=True)
     print("  Final supervision = dataset chosen/rejected; Optimizer steps = 0", flush=True)
-    print("  beta_sys=0.5 beta_A=0.5; confidence rule = placeholder f(c)=0.5*c", flush=True)
+    print(f"  beta_sys=0.5 beta_A=0.5; lambda_A={LAMBDA_A}", flush=True)
 
     results, errors = [], []
     for row in rows:
@@ -262,7 +280,7 @@ def main():
             results.append(result)
             errors.extend({"id": row.id, **error} for error in result.errors)
             print(f"  step={len(results):02d}/{len(rows)} question={row.id} "
-                  f"y_preference={result.intermediate_judgment.choice if result.intermediate_judgment else 'unavailable'} "
+                  f"comparisons_accepted={result.comparisons_accepted} "
                   f"scoring_request={'ready' if result.scoring_request else 'unavailable'} "
                   f"errors={len(result.errors)}", flush=True)
         except Exception as error:
@@ -271,13 +289,14 @@ def main():
 
     intermediate = []
     for row in results:
-        judgment = row.intermediate_judgment
-        if judgment and judgment.winner and judgment.confidence > 0:
-            chosen, rejected = ((row.y1, row.y2) if judgment.winner == "y1" else (row.y2, row.y1))
+        if not row.comparisons_accepted:
+            continue
+        candidates = {"y1": row.y1, "y2": row.y2, "y3": row.y3}
+        for winner, loser in row.preference_edges:
             intermediate.append(IntermediatePreference(
                 id=row.id, x=row.x, system=row.system, a_messages=row.a_messages,
-                y_chosen=chosen, y_rejected=rejected,
-                confidence=judgment.confidence, finish_reasons=row.finish_reasons))
+                y_chosen=candidates[winner], y_rejected=candidates[loser],
+                finish_reasons=row.finish_reasons))
 
     save_json(args.output_dir / "intermediate_preferences.json", intermediate)
 

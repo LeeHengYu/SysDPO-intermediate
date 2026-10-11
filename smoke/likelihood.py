@@ -16,12 +16,7 @@ import torch.nn.functional as F
 from schemas import IntermediatePreference, ScoringRequest
 
 
-def confidence_weight(confidence):
-    if not torch.isfinite(confidence).all() or not ((confidence >= 0) & (confidence <= 1)).all():
-        raise ValueError("Confidence must be finite and in [0, 1].")
-
-    # Placeholder f; the research mapping is still undecided.
-    return 0.5 * confidence.detach()
+LAMBDA_A = 0.5
 
 
 def dpo_pair_loss(chosen, rejected, ref_chosen, ref_rejected, beta=0.5):
@@ -86,7 +81,7 @@ def completion_logp(model, tokenizer, messages, completion, reduction="mean"):
 
 def score_request(request: ScoringRequest, mid_model, output_model, ref_mid_model, ref_output_model,
                   mid_tokenizer, output_tokenizer, reduction="mean"):
-    """All four supplied z/context combinations, plus both A candidates and refs."""
+    """Score both final answers under every candidate context, plus A and refs."""
     request = ScoringRequest(**asdict(request))
 
     def score_models(mid_model, output_model):
@@ -106,14 +101,14 @@ def score_request(request: ScoringRequest, mid_model, output_model, ref_mid_mode
 
 
 def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0.5):
-    """scores: A [N,2], B [N,2,2]; pairs: (row, chosen_y_index, confidence)."""
+    """A [N,K], B [N,K,2]; pairs: (row, chosen_index, rejected_index)."""
     a, b, a_ref, b_ref = (scores[key] for key in ("a", "b", "a_ref", "b_ref"))
     if a.ndim != 2:
-        raise ValueError("Expected A score matrix [N,2]")
+        raise ValueError("Expected A score matrix [N,K]")
 
-    n = a.shape[0]
-    if n == 0 or a.shape != (n, 2) or a_ref.shape != a.shape or b.shape != (n, 2, 2) or b_ref.shape != b.shape:
-        raise ValueError("Expected nonempty A [N,2] and B [N,2,2] score tensors")
+    n, k = a.shape
+    if n == 0 or k < 2 or a_ref.shape != a.shape or b.shape != (n, k, 2) or b_ref.shape != b.shape:
+        raise ValueError("Expected nonempty A [N,K] and B [N,K,2] score tensors")
     if any(not torch.isfinite(t).all() or (t > 1e-6).any() for t in (a, b, a_ref, b_ref)):
         raise ValueError("Completion log scores must be finite and nonpositive")
 
@@ -130,20 +125,20 @@ def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0
     auxiliary = a.new_zeros(())
     if pairs:
         indices = [pair[0] for pair in pairs]
-        if len(set(indices)) != len(indices) or any(not 0 <= i < n for i in indices):
-            raise ValueError("Intermediate pairs need distinct valid question indices")
-        if any(pair[1] not in (0, 1) for pair in pairs):
-            raise ValueError("Intermediate chosen index must be 0 or 1")
+        if any(not 0 <= i < n for i in indices):
+            raise ValueError("Intermediate pairs need valid question indices")
+        if any(not 0 <= p[1] < k or not 0 <= p[2] < k or p[1] == p[2] for p in pairs):
+            raise ValueError("Intermediate pairs need distinct valid candidate indices")
 
         rows = torch.tensor(indices, device=a.device)
         chosen = torch.tensor([pair[1] for pair in pairs], device=a.device)
-        if not (candidate_mask[rows].all(dim=1)).all():
+        rejected = torch.tensor([pair[2] for pair in pairs], device=a.device)
+        if not (candidate_mask[rows, chosen] & candidate_mask[rows, rejected]).all():
             raise ValueError("Intermediate preference requires two distinct candidates")
 
-        confidence = a.new_tensor([pair[2] for pair in pairs])
-        losses = dpo_pair_loss(a[rows, chosen], a[rows, 1 - chosen],
-                              a_ref[rows, chosen], a_ref[rows, 1 - chosen], beta_a)
-        auxiliary = (confidence_weight(confidence) * losses).sum() / len(pairs)
+        losses = dpo_pair_loss(a[rows, chosen], a[rows, rejected],
+                              a_ref[rows, chosen], a_ref[rows, rejected], beta_a)
+        auxiliary = LAMBDA_A * losses.mean()
 
     system = system_rows.mean()
     return {"L_sys": system, "L_A_weighted": auxiliary, "L_total": system + auxiliary,
@@ -175,13 +170,14 @@ def compute_saved_losses(path, requests: list[ScoringRequest], intermediate: lis
     for pair in intermediate:
         i = indices[pair.id]
         chosen = requests[i].intermediates.index(pair.y_chosen)
-        if pair.y_rejected != requests[i].intermediates[1 - chosen]:
+        if pair.y_rejected not in requests[i].intermediates:
             raise ValueError("Rejected intermediate does not match the scoring request")
-        pairs.append((i, chosen, pair.confidence))
+        rejected = requests[i].intermediates.index(pair.y_rejected)
+        pairs.append((i, chosen, rejected))
 
     mask = torch.tensor([r.candidate_mask for r in requests], dtype=torch.bool)
     losses = preference_losses(scores, pairs, mask)
     return {**{key: value.item() if torch.is_tensor(value) else value for key, value in losses.items()},
             "status": "loss_evaluated_no_weight_updates", "reduction": source["reduction"],
             "include_eos": True, "scores_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "confidence_weight": "placeholder f(c)=0.5*c"}
+            "lambda_A": LAMBDA_A}

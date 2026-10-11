@@ -11,7 +11,6 @@ from pydantic.dataclasses import dataclass
 
 CONFIG = {"extra": "forbid", "validate_assignment": True}
 Text = Annotated[str, StringConstraints(strict=True, pattern=r"\S")]
-Confidence = Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)]
 Messages = list[dict[str, StrictStr]]
 
 
@@ -34,11 +33,9 @@ class DatasetRow:
 
 @dataclass(config=CONFIG)
 class Judgment:
-    choice: Literal["1", "2", "tie", "uncertain", "duplicate"]
-    confidence: Confidence
-    reason: StrictStr
-    presented_order: list[Literal["y1", "y2"]] = field(default_factory=list)
-    winner: Literal["y1", "y2"] | None = None
+    choice: Literal["option1", "option2", "tie"]
+    presented_order: list[Literal["y1", "y2", "y3"]] = field(default_factory=list)
+    winner: Literal["y1", "y2", "y3"] | None = None
 
 
 @dataclass(config=CONFIG)
@@ -58,7 +55,6 @@ class IntermediatePreference:
     a_messages: Messages
     y_chosen: Text
     y_rejected: Text
-    confidence: Confidence
     finish_reasons: dict[str, StrictStr]
 
     def __post_init__(self):
@@ -70,13 +66,15 @@ class IntermediatePreference:
 class ScoringRequest:
     id: StrictInt
     a_messages: Messages
-    intermediates: Annotated[list[Text], Field(min_length=2, max_length=2)]
-    b_messages: Annotated[list[Messages], Field(min_length=2, max_length=2)]
+    intermediates: Annotated[list[Text], Field(min_length=2, max_length=3)]
+    b_messages: Annotated[list[Messages], Field(min_length=2, max_length=3)]
     final_answers: Annotated[list[Text], Field(min_length=2, max_length=2)]
-    candidate_mask: Annotated[list[StrictBool], Field(min_length=2, max_length=2)]
+    candidate_mask: Annotated[list[StrictBool], Field(min_length=2, max_length=3)]
     request_sha256: str = ""
 
     def __post_init__(self):
+        if len(self.intermediates) != len(self.b_messages) or len(self.intermediates) != len(self.candidate_mask):
+            raise ValueError("Candidates, B contexts and mask must have matching lengths")
         if not any(self.candidate_mask):
             raise ValueError("Each question needs a usable intermediate candidate")
 
@@ -101,7 +99,11 @@ class QuestionRecord:
     errors: list[dict[str, str]] = field(default_factory=list)
     y1: str | None = None
     y2: str | None = None
-    intermediate_judgment: Judgment | None = None
+    y3: str | None = None
+    intermediate_judgments: list[Judgment] = field(default_factory=list)
+    preference_edges: list[tuple[str, str]] = field(default_factory=list)
+    comparisons_accepted: bool = False
+    discard_reason: str | None = None
     scoring_request: ScoringRequest | None = None
 
     @model_serializer(mode="wrap")

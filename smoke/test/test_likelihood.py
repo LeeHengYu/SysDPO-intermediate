@@ -15,7 +15,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from likelihood import completion_logp, confidence_weight, dpo_pair_loss, get_probs, preference_losses, score_request
+from likelihood import LAMBDA_A, completion_logp, dpo_pair_loss, get_probs, preference_losses, score_request
 from train import accumulate_gradients, freeze
 from schemas import ScoringRequest
 
@@ -54,10 +54,9 @@ def collect_intermediate_pairs(a_snapshot, attempts=128):
     first_wins = utility[:, 0] > utility[:, 1]
     chosen = torch.where(first_wins, draws[:, 0], draws[:, 1])
     rejected = torch.where(first_wins, draws[:, 1], draws[:, 0])
-    confidence = (utility[:, 0] - utility[:, 1]).abs().float() / (MESSAGES - 1)
     if not len(x):
         raise ValueError("No intermediate preferences accepted.")
-    return x, chosen, rejected, confidence
+    return x, chosen, rejected
 
 
 def dpo_loss(logp, ref_logp, chosen, rejected, beta):
@@ -83,10 +82,10 @@ def compute_system_loss(a, b, a_ref, b_ref, batch, beta=0.5):
 
 
 def compute_intermediate_loss(a, a_ref, batch, beta=0.5):
-    x, chosen, rejected, confidence = batch
+    x, chosen, rejected = batch
     with torch.no_grad():
         ref = a_ref(x)
-    return confidence_weight(confidence) * dpo_loss(a(x), ref, chosen, rejected, beta)
+    return LAMBDA_A * dpo_loss(a(x), ref, chosen, rejected, beta)
 
 
 def get_gradients(a, b):
@@ -120,13 +119,12 @@ def run_numerical_smoke():
     # Identical initial policy/reference => each unweighted DPO loss is log(2).
     torch.testing.assert_close(sys_fn(system_batch), torch.full((128,), math.log(2)))
     torch.testing.assert_close(aux_fn(intermediate_batch).mean(),
-                               confidence_weight(intermediate_batch[3]).mean() * math.log(2))
+                               torch.tensor(LAMBDA_A * math.log(2)))
 
-    # L_A reaches A only; L_sys reaches both; refs and confidence remain detached.
-    confidence = intermediate_batch[3].clone().requires_grad_()
-    aux_fn((*intermediate_batch[:3], confidence)).mean().backward()
+    # L_A reaches A only; L_sys reaches both; references remain frozen.
+    aux_fn(intermediate_batch).mean().backward()
     assert a.logits.weight.grad.abs().sum() > 0
-    assert all(p.grad is None for p in b.parameters()) and confidence.grad is None
+    assert all(p.grad is None for p in b.parameters())
     zero_grad(a, b)
     sys_fn(system_batch).mean().backward()
     assert all(p.grad is not None and p.grad.abs().sum() > 0
@@ -142,18 +140,6 @@ def run_numerical_smoke():
         accumulate_gradients(aux_fn, intermediate_batch, microbatch)
         for actual, target in zip(get_gradients(a, b), expected):
             torch.testing.assert_close(actual, target, rtol=2e-5, atol=1e-7)
-
-    zero_grad(a, b)
-    aux_fn((*intermediate_batch[:3], torch.zeros(32))).mean().backward()
-    assert a.logits.weight.grad.count_nonzero() == 0
-    assert all(p.grad is None for p in b.parameters())
-    for invalid in (-0.1, 1.1, float("nan")):
-        try:
-            confidence_weight(torch.tensor([invalid]))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Invalid confidence accepted")
 
     with torch.no_grad():
         before = (sys_fn(system_batch).mean().item(), aux_fn(intermediate_batch).mean().item())
@@ -181,7 +167,7 @@ def run_numerical_smoke():
     for previous, current in zip(references_before, [*a_ref.parameters(), *b_ref.parameters()]):
         assert torch.equal(previous, current) and current.grad is None
     print(f"Accepted {len(pool[0])}/128 synthetic pairs; N=128, M=32, microbatch=2.")
-    print("PASS: accumulation, loss scaling, gradient routing, detached confidence, frozen refs, training.")
+    print("PASS: accumulation, loss scaling, gradient routing, frozen refs, training.")
     print("CPU toy only: no real LLM/API, tokenizer, LoRA, FP16 or GPU-fit validation.")
 
 
@@ -321,9 +307,9 @@ class LikelihoodChecks(unittest.TestCase):
                                  candidate_mask=[True, True])
         scores = score_request(request, a, b, a_ref, b_ref, tokenizer, tokenizer)
         scores = {k: value[None] for k, value in scores.items()}
-        losses = preference_losses(scores, [(0, 0, 0.8)])
+        losses = preference_losses(scores, [(0, 0, 1)])
         self.assertAlmostEqual(losses["L_sys"].item(), math.log(2), places=6)
-        self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.4 * math.log(2), places=6)
+        self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.5 * math.log(2), places=6)
         losses["L_total"].backward()
         self.assertIsNotNone(a.logits.grad)
         self.assertIsNotNone(b.logits.grad)
@@ -339,8 +325,8 @@ class LikelihoodChecks(unittest.TestCase):
         b = torch.tensor([[[-1., -2.], [-3., -1.]], [[-2., -1.], [-1., -3.]]], requires_grad=True)
         scores = {"a": a, "b": b, "a_ref": a.detach().clone().requires_grad_(),
                   "b_ref": b.detach().clone().requires_grad_()}
-        losses = preference_losses(scores, [(0, 0, 0.2), (1, 1, 0.8)])
-        self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.25 * math.log(2), places=6)
+        losses = preference_losses(scores, [(0, 0, 1), (1, 1, 0)])
+        self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.5 * math.log(2), places=6)
         losses["L_A_weighted"].backward(retain_graph=True)
         self.assertGreater(a.grad.abs().sum(), 0)
         self.assertIsNone(b.grad)
@@ -354,7 +340,22 @@ class LikelihoodChecks(unittest.TestCase):
         self.assertEqual(empty["M"], 0)
         self.assertEqual(empty["L_A_weighted"].item(), 0)
         with self.assertRaises(ValueError):
-            preference_losses(scores, [(0, 0, 1.1)])
+            preference_losses(scores, [(0, 0, 0)])
+
+    def test_three_pairs_share_one_question(self):
+        a = torch.tensor([[-1., -2., -3.]], requires_grad=True)
+        b = torch.tensor([[[-1., -2.], [-2., -1.], [-3., -1.]]], requires_grad=True)
+        scores = {"a": a, "b": b, "a_ref": a.detach().clone(), "b_ref": b.detach().clone()}
+        pairs = [(0, 0, 1), (0, 0, 2), (0, 1, 2)]
+        losses = preference_losses(scores, pairs)
+        self.assertEqual(losses["N"], 1)
+        self.assertEqual(losses["M"], 3)
+        self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.5 * math.log(2), places=6)
+        losses["L_A_weighted"].backward()
+        self.assertLess(a.grad[0, 0].item(), 0)
+        self.assertAlmostEqual(a.grad[0, 1].item(), 0)
+        self.assertGreater(a.grad[0, 2].item(), 0)
+        self.assertIsNone(b.grad)
 
 
 if __name__ == "__main__":
