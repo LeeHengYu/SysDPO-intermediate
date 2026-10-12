@@ -176,6 +176,24 @@ class SmokeChecks(unittest.TestCase):
             model_api.response_text(truncated)
         self.assertEqual(model_api.response_text(truncated, allow_truncated=True), "partial")
 
+    def test_decision_api_interface(self):
+        raw = {"answers": {"preference": {"type": "choice", "choice": "option2"}},
+               "usage": {"input_tokens": 100, "output_tokens": 0, "cost": 0.0000042}}
+        with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
+                patch.object(model_api, "urlopen", return_value=io.BytesIO(json.dumps(raw).encode())) as opener:
+            result = model_api.call_model("microsoft/microsoft-decision-1", [
+                {"role": "system", "content": "Compare quality"},
+                {"role": "user", "content": '{"candidate_1":"a","candidate_2":"b"}'}], json_output=True)
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, "https://openrouter.ai/api/alpha/decisions")
+        payload = json.loads(request.data)
+        self.assertEqual(set(payload), {"model", "state", "questions"})
+        self.assertEqual(set(payload["questions"]["preference"]["criteria"]), {"option1", "option2", "tie"})
+        self.assertEqual(json.loads(model_api.response_text(result)), {"choice": "option2"})
+        raw["answers"]["preference"]["choice"] = "unknown"
+        with self.assertRaises(ValueError):
+            model_api.response_text(raw)
+
     def test_ten_questions_and_cache(self):
         def fake_call(model, messages, **settings):
             self.assertEqual([m["role"] for m in messages], ["system", "user"])

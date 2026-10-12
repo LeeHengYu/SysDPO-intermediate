@@ -29,7 +29,7 @@ from schemas import (
 
 
 GENERATOR = "qwen/qwen-2.5-7b-instruct"
-JUDGE = "deepseek/deepseek-v3.2"
+JUDGE = "microsoft/microsoft-decision-1"
 PROMPT_FILE = Path(__file__).with_name("prompts.json")
 
 
@@ -251,7 +251,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "calls").mkdir(exist_ok=True)
 
-    config = {"workflow_version": 8, "questions": args.questions, "max_tokens": args.max_tokens,
+    config = {"workflow_version": 9, "questions": args.questions, "max_tokens": args.max_tokens,
               "generation_temperature": 0.3,
               "lambda_A": LAMBDA_A,
               "prompts": asdict(prompts), "generator": GENERATOR, "judge": JUDGE}
@@ -324,9 +324,12 @@ def main():
     for path in (args.output_dir / "calls").glob("*.json"):
         call = json.loads(path.read_text())
         stages[call["stage"]] += 1
-        for name, value in call.get("response", {}).get("usage", {}).items():
+        usage = call.get("response", {}).get("usage", {})
+        for name, value in usage.items():
             if type(value) in (int, float):
-                totals[name] += value
+                totals[{"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens"}.get(name, name)] += value
+        if "input_tokens" in usage and "total_tokens" not in usage:
+            totals["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
 
     summary = {"requested_questions": args.questions,
                "completed_questions": sum(not row.errors for row in results),

@@ -17,8 +17,20 @@ def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output
         payload["response_format"] = {"type": "json_object"}
         payload["reasoning"] = {"enabled": False}
 
+    endpoint = "https://openrouter.ai/api/v1/chat/completions"
+    if model == "microsoft/microsoft-decision-1":
+        endpoint = "https://openrouter.ai/api/alpha/decisions"
+        payload = {"model": model, "state": json.loads(messages[1]["content"]),
+                   "questions": {"preference": {
+                       "type": "choice", "instructions": messages[0]["content"],
+                       "criteria": {
+                           "option1": "candidate_1 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
+                           "option2": "candidate_2 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
+                           "tie": "Neither candidate has a clear advantage in correctness, completeness, required output format, downstream usefulness, or conciseness, or the preference cannot be assessed reliably.",
+                       }}}}
+
     request = Request(
-        "https://openrouter.ai/api/v1/chat/completions",
+        endpoint,
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
@@ -40,6 +52,16 @@ def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output
 def response_text(result, *, allow_truncated=False):
     if "error" in result:
         raise ValueError("OpenRouter returned an API error")
+
+    if "answers" in result:
+        answer = result["answers"]["preference"]
+        if answer.get("type") != "choice" or answer.get("choice") not in ("option1", "option2", "tie"):
+            raise ValueError("Invalid Decisions preference answer")
+        usage = result.get("usage", {})
+        if any(type(usage.get(name)) is not int or usage[name] < 0
+               for name in ("input_tokens", "output_tokens")):
+            raise ValueError("Missing or invalid Decisions token usage")
+        return json.dumps({"choice": answer["choice"]})
 
     try:
         choice = result["choices"][0]
