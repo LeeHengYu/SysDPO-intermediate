@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["torch==2.8.0", "pydantic==2.13.5"]
-# ///
 """Numerical fixtures only: no downloads, API requests or production weights."""
 
 from copy import deepcopy

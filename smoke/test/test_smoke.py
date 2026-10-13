@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["torch==2.8.0", "pydantic==2.13.5"]
-# ///
 """Offline checks; never access the user's key or make network calls."""
 
 from contextlib import redirect_stdout
@@ -15,8 +11,9 @@ import runpy
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
-from urllib.error import HTTPError
+from unittest.mock import Mock, patch
+
+import httpx
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -150,24 +147,62 @@ class SmokeChecks(unittest.TestCase):
         self.assertEqual(result.exception.code, 0)
         self.assertIn("--questions", terminal.getvalue())
 
+    def test_dataset_library_and_cache(self):
+        source = [{"question": "x1", "chosen": "c1", "rejected": "r1"},
+                  {"question": "x2", "chosen": "c2", "rejected": "r2"},
+                  {"question": "x3", "chosen": "c3", "rejected": "r3"}]
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(train, "load_dataset", return_value=iter(source)) as loader:
+            output = Path(temporary)
+            rows = train.load_questions(output, 2)
+            loader.assert_called_once_with("Intel/orca_dpo_pairs", split="train", streaming=True)
+            self.assertEqual([row.id for row in rows], [0, 1])
+            self.assertEqual([row.question for row in rows], ["x1", "x2"])
+            self.assertEqual(train.load_questions(output, 2), rows)
+            self.assertEqual(loader.call_count, 1)
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(train, "load_dataset", return_value=iter(source[:1])):
+            with self.assertRaisesRegex(ValueError, "wrong number"):
+                train.load_questions(Path(temporary), 2)
+
     def test_api_interface(self):
-        response = io.BytesIO(json.dumps(completion("answer")).encode())
+        raw = {**completion("answer"), "created": 0, "id": "test",
+               "object": "chat.completion", "system_fingerprint": None,
+               "provider": "test-provider"}
+        raw["choices"][0]["index"] = 0
+        raw["choices"][0]["message"]["role"] = "assistant"
+        raw["usage"]["cost"] = 0.001
+        client_class = httpx.Client
+        handler = Mock(return_value=httpx.Response(200, json=raw))
         with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
-                patch.object(model_api, "urlopen", return_value=response) as opener:
+                patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
+                             client_class(transport=httpx.MockTransport(handler), **kwargs)):
             result = model_api.call_model("model", [{"role": "user", "content": "x"}])
+        self.assertEqual(result, raw)
         self.assertEqual(model_api.response_text(result), "answer")
-        self.assertEqual(opener.call_count, 1)
-        payload = json.loads(opener.call_args.args[0].data)
+        self.assertEqual(handler.call_count, 1)
+        request = handler.call_args.args[0]
+        self.assertEqual(str(request.url), "https://openrouter.ai/api/v1/chat/completions")
+        payload = json.loads(request.content)
         self.assertEqual(payload["messages"], [{"role": "user", "content": "x"}])
         self.assertEqual(payload["max_tokens"], 8192)
         self.assertEqual(payload["temperature"], 0.3)
-        with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
-                patch.object(model_api, "urlopen", side_effect=HTTPError("url", 429, "rate limit", {}, None)):
-            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
-                model_api.call_model("model", [{"role": "user", "content": "x"}])
+        for status in (429, 503):
+            handler = Mock(return_value=httpx.Response(status, json={"error": {
+                "code": status, "message": "Unavailable"}}))
+            with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
+                    patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
+                                 client_class(transport=httpx.MockTransport(handler), **kwargs)):
+                with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
+                    model_api.call_model("model", [{"role": "user", "content": "x"}])
+            self.assertEqual(handler.call_count, 1)
 
     def test_invalid_responses(self):
-        for result in ({}, completion(""), {**completion("answer"), "usage": {}}):
+        for result, error in (({}, KeyError), ({"choices": []}, IndexError),
+                              ({"choices": None}, TypeError)):
+            with self.assertRaises(error):
+                model_api.response_text(result)
+        for result in (completion(""), {**completion("answer"), "usage": {}}):
             with self.assertRaises(ValueError):
                 model_api.response_text(result)
         truncated = completion("partial")
@@ -176,18 +211,72 @@ class SmokeChecks(unittest.TestCase):
             model_api.response_text(truncated)
         self.assertEqual(model_api.response_text(truncated, allow_truncated=True), "partial")
 
+    def test_sdk_schema_mismatch_keeps_raw_reply(self):
+        raw = {**completion("answer"), "created": "bad metadata", "id": "test",
+               "object": "chat.completion", "system_fingerprint": None}
+        raw["choices"][0]["index"] = 0
+        raw["choices"][0]["message"]["role"] = "assistant"
+        client_class = httpx.Client
+        handler = Mock(return_value=httpx.Response(200, json=raw))
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
+                patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
+                             client_class(transport=httpx.MockTransport(handler), **kwargs)):
+            output = Path(temporary)
+            (output / "calls").mkdir()
+            messages = [{"role": "user", "content": "x"}]
+            self.assertEqual(train.recorded_call(output, 0, "y1", "model", messages), "answer")
+            self.assertEqual(json.loads((output / "calls/0_y1.json").read_text())["response"], raw)
+            self.assertEqual(train.recorded_call(output, 0, "y1", "model", messages), "answer")
+            self.assertEqual(handler.call_count, 1)
+
+    def test_invalid_decision_usage_keeps_summary(self):
+        raw = {"answers": {"preference": {"type": "choice", "choice": "option1"}},
+               "usage": {"input_tokens": 100}}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            train.save_json(output / "dataset.json", {"rows": [
+                {"id": 0, "question": "x", "chosen": "c", "rejected": "r"}]})
+
+            def fake_call(model, messages, **settings):
+                return raw if settings.get("json_output") else completion(f"y{api.call_count}")
+
+            with patch.object(train, "call_model", side_effect=fake_call) as api, \
+                    patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
+                    redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as failure:
+                    train.main()
+            self.assertEqual(failure.exception.code, 1)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["losses"]["N"], 1)
+            self.assertEqual(summary["losses"]["M"], 0)
+            self.assertEqual(len(summary["errors"]), 1)
+            self.assertEqual(summary["usage"]["prompt_tokens"], 130)
+            self.assertEqual(summary["usage"]["total_tokens"], 45)
+            self.assertEqual(json.loads((output / "calls/0_judge_y1_y2.json").read_text())["response"], raw)
+
     def test_decision_api_interface(self):
-        raw = {"answers": {"preference": {"type": "choice", "choice": "option2"}},
+        raw = {"model": "microsoft/microsoft-decision-1", "provider": "Azure",
+               "answers": {"preference": {"type": "choice", "choice": "option2",
+                                          "confidence": 0.6,
+                                          "probabilities": {"option1": 0.2, "option2": 0.8}}},
                "usage": {"input_tokens": 100, "output_tokens": 0, "cost": 0.0000042}}
+        client_class = httpx.Client
+        handler = Mock(return_value=httpx.Response(200, json=raw))
         with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
-                patch.object(model_api, "urlopen", return_value=io.BytesIO(json.dumps(raw).encode())) as opener:
+                patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
+                             client_class(transport=httpx.MockTransport(handler), **kwargs)):
             result = model_api.call_model("microsoft/microsoft-decision-1", [
                 {"role": "system", "content": "Compare quality"},
                 {"role": "user", "content": '{"candidate_1":"a","candidate_2":"b"}'}], json_output=True)
-        request = opener.call_args.args[0]
-        self.assertEqual(request.full_url, "https://openrouter.ai/api/alpha/decisions")
-        payload = json.loads(request.data)
+        self.assertEqual(result, raw)
+        self.assertEqual(handler.call_count, 1)
+        request = handler.call_args.args[0]
+        self.assertEqual(str(request.url), "https://openrouter.ai/api/alpha/decisions")
+        payload = json.loads(request.content)
         self.assertEqual(set(payload), {"model", "state", "questions"})
+        self.assertEqual(payload["state"], {"candidate_1": "a", "candidate_2": "b"})
+        self.assertEqual(payload["questions"]["preference"]["instructions"], "Compare quality")
         self.assertEqual(set(payload["questions"]["preference"]["criteria"]), {"option1", "option2", "tie"})
         self.assertEqual(json.loads(model_api.response_text(result)), {"choice": "option2"})
         raw["answers"]["preference"]["choice"] = "unknown"

@@ -2,8 +2,9 @@
 
 import json
 import os
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+import httpx
+from openrouter import OpenRouter
+from openrouter.errors import OpenRouterError, ResponseValidationError
 
 
 def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output=False):
@@ -17,9 +18,7 @@ def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output
         payload["response_format"] = {"type": "json_object"}
         payload["reasoning"] = {"enabled": False}
 
-    endpoint = "https://openrouter.ai/api/v1/chat/completions"
     if model == "microsoft/microsoft-decision-1":
-        endpoint = "https://openrouter.ai/api/alpha/decisions"
         payload = {"model": model, "state": json.loads(messages[1]["content"]),
                    "questions": {"preference": {
                        "type": "choice", "instructions": messages[0]["content"],
@@ -29,19 +28,22 @@ def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output
                            "tie": "Neither candidate has a clear advantage in correctness, completeness, required output format, downstream usefulness, or conciseness, or the preference cannot be assessed reliably.",
                        }}}}
 
-    request = Request(
-        endpoint,
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-
-    # No retry: keep each judge invocation single-shot and failures visible.
+    # Capture the raw JSON so SDK parsing cannot drop provider or usage metadata.
+    responses = []
     try:
-        with urlopen(request, timeout=600) as response:
-            result = json.load(response)
-    except HTTPError as error:
-        raise RuntimeError(f"OpenRouter HTTP {error.code}") from None
-    except (URLError, TimeoutError):
+        with httpx.Client(event_hooks={"response": [responses.append]}) as http_client:
+            with OpenRouter(api_key=key, client=http_client, retry_config=None,
+                            timeout_ms=600_000) as client:
+                if model == "microsoft/microsoft-decision-1":
+                    client.alpha.decisions.create(**payload)
+                else:
+                    client.chat.send(**payload)
+                result = responses[-1].json()
+    except ResponseValidationError as error:
+        result = error.raw_response.json()
+    except OpenRouterError as error:
+        raise RuntimeError(f"OpenRouter HTTP {error.status_code}") from None
+    except httpx.RequestError:
         raise RuntimeError("OpenRouter connection failed or timed out") from None
 
     if not isinstance(result, dict):
@@ -63,11 +65,8 @@ def response_text(result, *, allow_truncated=False):
             raise ValueError("Missing or invalid Decisions token usage")
         return json.dumps({"choice": answer["choice"]})
 
-    try:
-        choice = result["choices"][0]
-        text = choice["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise ValueError("Missing completion text") from None
+    choice = result["choices"][0]
+    text = choice["message"]["content"]
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Empty completion text")
 

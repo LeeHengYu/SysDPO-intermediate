@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["torch==2.8.0", "pydantic==2.13.5"]
-# ///
 """Procedural SysDPO-style collection, batching and update utilities."""
 
 import argparse
@@ -10,13 +6,12 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
-from itertools import combinations
+from itertools import combinations, islice
 import json
 from pathlib import Path
 import random
-from urllib.parse import urlencode
-from urllib.request import urlopen
 
+from datasets import load_dataset
 from pydantic import TypeAdapter
 
 from model_api import call_model, response_text
@@ -83,20 +78,14 @@ def load_questions(output_dir, count) -> list[DatasetRow]:
             raise ValueError("Cached question count differs; use another output directory")
         return [DatasetRow(**row) for row in saved["rows"]]
 
-    url = "https://datasets-server.huggingface.co/rows?" + urlencode({
-        "dataset": "Intel/orca_dpo_pairs", "config": "default", "split": "train",
-        "offset": 0, "length": count,
-    })
-    with urlopen(url, timeout=60) as response:
-        dataset = json.load(response)
-
-    rows = [{"id": item["row_idx"], **item["row"]} for item in dataset["rows"]]
+    dataset = load_dataset("Intel/orca_dpo_pairs", split="train", streaming=True)
+    rows = [{"id": index, **row} for index, row in enumerate(islice(dataset, count))]
     if len(rows) != count:
-        raise ValueError("Dataset endpoint returned the wrong number of questions")
+        raise ValueError("Dataset returned the wrong number of questions")
     validated = [DatasetRow(**row) for row in rows]
 
-    save_json(path, {"source": url, "retrieved_utc": datetime.now(timezone.utc).isoformat(),
-                     "rows": rows})
+    save_json(path, {"source": "Intel/orca_dpo_pairs", "split": "train",
+                     "retrieved_utc": datetime.now(timezone.utc).isoformat(), "rows": rows})
     return validated
 
 
@@ -328,7 +317,7 @@ def main():
         for name, value in usage.items():
             if type(value) in (int, float):
                 totals[{"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens"}.get(name, name)] += value
-        if "input_tokens" in usage and "total_tokens" not in usage:
+        if "input_tokens" in usage and "output_tokens" in usage and "total_tokens" not in usage:
             totals["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
 
     summary = {"requested_questions": args.questions,

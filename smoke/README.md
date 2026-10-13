@@ -15,13 +15,17 @@ These repeated interfaces use attributes (`row.question`, `judgment.choice`, `re
 
 ## Actual-data collection
 
+Run from `sysdpo-extend/` using its existing repository environment:
+
 ```sh
-uv run smoke/train.py --questions 10
+uv pip install --python .venv/bin/python -r requirements.txt
+source .venv/bin/activate
+uv run --active python smoke/train.py --questions 10
 ```
 
 One round reads the first ten `Intel/orca_dpo_pairs` training rows. Qwen `qwen/qwen-2.5-7b-instruct` generates three ordinary intermediates per question at temperature 0.3. Microsoft `microsoft/microsoft-decision-1` compares `(y1,y2)`, `(y1,y3)`, then `(y2,y3)` in separate stateless requests with randomized presentation order. A preferred candidate points to the rejected candidate. `topo_sort.py` checks the three directed edges for cycles. An acyclic triple contributes all three intermediate preference pairs; a cyclic triple contributes none. Tie, duplicate or failed comparisons stop the remaining judge calls and discard the entire intermediate preference triple. Complete generations remain available for system scoring even when intermediate preferences are discarded. No retries are made. This path generates **no final answers** and makes **no final-answer judge calls**. Maximum collection workload: 30 generations + 30 judgments.
 
-The API wrapper reads `OPENROUTER_KEY`. Qwen generation uses chat completions; Microsoft Decision-1 judging uses `POST /api/alpha/decisions` with a three-option choice question. Only the returned class is used for preferences; native response probabilities are saved but do not weight the loss. Native Decisions input/output usage is mapped to the run's prompt/completion token totals. If it is exported only in `~/.zshrc`, use an interactive zsh terminal. Requests contain fresh system/user messages; keys are never saved. Outputs, usage, provider/model metadata and failures are cached. Duplicate intermediates skip judging. Both complete candidates remain available to system scoring regardless of the intermediate judgment. An intermediate-judge failure therefore does not discard the system-scoring request or the dataset's system preferences.
+The API wrapper uses the official OpenRouter Python SDK and reads `OPENROUTER_KEY`. SDK retries are disabled, preserving one HTTP attempt per invocation. Raw JSON responses are captured through HTTPX so provider metadata and cost fields survive SDK parsing. Qwen generation uses chat completions; Microsoft Decision-1 judging uses `POST /api/alpha/decisions` with a three-option choice question. Only the returned class is used for preferences; native response probabilities are saved but do not weight the loss. Native Decisions input/output usage is mapped to the run's prompt/completion token totals. If it is exported only in `~/.zshrc`, use an interactive zsh terminal. Requests contain fresh system/user messages; keys are never saved. Outputs, usage, provider/model metadata and failures are cached. Duplicate intermediates skip judging. Both complete candidates remain available to system scoring regardless of the intermediate judgment. An intermediate-judge failure therefore does not discard the system-scoring request or the dataset's system preferences.
 
 Edit `prompts.json` for A/B role instructions, instruction precedence and the intermediate rubric, or pass `--prompt-file PATH`. B scoring conditions on dataset instructions (part of x), the question, the intermediate draft, the instruction policy and b_instruction. Both current B and frozen B reference receive the same context. Like upstream SysDPO, a fixed synthesis instruction is included in conditioning; our wording and message layout differ from upstream. Prompt tokens are excluded from the scored loss but remain visible to the model. `--max-tokens` defaults to 8,192. Partial outputs remain saved, but are not judged or exported as usable pairs. There are no continuation calls. A finite bound and provider context limits can still prevent completion.
 
@@ -89,7 +93,7 @@ scores = score_request(request, A, B, A_ref, B_ref, tokenizer_A, tokenizer_B)
 Alternatively, evaluate externally computed scores:
 
 ```sh
-uv run smoke/train.py --questions 10 --scores /absolute/path/to/scores.json
+uv run --active python smoke/train.py --questions 10 --scores /absolute/path/to/scores.json
 ```
 
 The score file is an object with `reduction` (`sum` or `mean`), `include_eos: true`, and `rows`. Each row contains `id`, the matching `request_sha256` from `scoring_requests.json`, and arrays `a`, `a_ref` of shape `[3]`, and `b`, `b_ref` of shape `[3,2]`. Supply **real completion log scores**, ordered `y1,y2,y3` and `zc,zr`; file values are not independently verified as model-produced. Every scoring-ready question must be covered once. Prompts/completions must match exactly. The file digest and scoring convention are saved with evaluated losses; this still performs zero optimizer steps.
@@ -115,12 +119,12 @@ Terminal reporting follows the procedural SysDPO pattern: running header, exampl
 ## Verification
 
 ```sh
-uv run smoke/test/test_smoke.py
-uv run smoke/test/test_likelihood.py
-uv run smoke/train.py --help
+uv run --active python smoke/test/test_smoke.py
+uv run --active python smoke/test/test_likelihood.py
+uv run --active python smoke/train.py --help
 ```
 
-Offline tests cover dataclass validation and JSON/cache compatibility, the 10-question/60-call collection/cache, no final generation, all six B scoring combinations, context-dependent B scores, failed intermediate judgments, incomplete candidates, exact prompt preservation, prompt/configuration protection, request mutation and score-file binding, scoring-failure accounting, completion/EOS masking, masked nonfinite logits, fixed-reference gradient exclusion, system gradients to A/B, auxiliary gradients to A only, and fixed auxiliary weighting. Fixtures use mock API responses or tiny numerical models, not real Qwen likelihoods. `uv` installs the pinned Torch and Pydantic script dependencies. Test scripts add their parent directory to the import path and run directly from the project root without setting `PYTHONPATH`.
+Offline tests cover dataclass validation and JSON/cache compatibility, the 10-question/60-call collection/cache, no final generation, all six B scoring combinations, context-dependent B scores, failed intermediate judgments, incomplete candidates, exact prompt preservation, prompt/configuration protection, request mutation and score-file binding, scoring-failure accounting, completion/EOS masking, masked nonfinite logits, fixed-reference gradient exclusion, system gradients to A/B, auxiliary gradients to A only, and fixed auxiliary weighting. Fixtures use mock API responses or tiny numerical models, not real Qwen likelihoods. `uv pip` installs dependencies from `sysdpo-extend/requirements.txt` into the repository `.venv`: Torch, Pydantic, Hugging Face Datasets, OpenRouter, and HTTPX. Dataset collection uses `datasets.load_dataset("Intel/orca_dpo_pairs", split="train", streaming=True)` and reads only the requested number of rows; existing `dataset.json` caches remain usable. Test scripts add their parent directory to the import path and run directly from the project root without setting `PYTHONPATH`.
 
 ## Numerical gradient smoke check
 
@@ -131,7 +135,7 @@ The smoke-specific changes add fixed auxiliary weighting and independent system/
 Run from the project root (CPU, no model downloads or paid API calls):
 
 ```sh
-uv run smoke/test/test_likelihood.py
+uv run --active python smoke/test/test_likelihood.py
 ```
 
 The numerical training fixture implements:
@@ -147,5 +151,3 @@ The numerical training fixture implements:
 Assertions compare accumulated gradients with full-batch gradients (microbatches 1, 2 and 7), check initial DPO loss, gradient routing, unchanged references, parameter updates, and decreasing losses on this fixture.
 
 The models are small categorical distributions over eight question IDs, four intermediate IDs and three final-answer IDs. System likelihood uses the **exact marginal over all four intermediates**, providing a simple mathematical check. It does not reproduce the released SysDPO candidate approximation or scoring heuristics. Adam's learning rate is chosen for the toy fixture, not copied from the paper.
-
-Before V100 training, connect the scoring helpers to tokenized causal LMs, the pinned dataset, the selected system-candidate convention and cached API judgments. Still to validate on real models: chat-template/EOS boundaries, LoRA, FP16/scaling, reference-adapter isolation, checkpoint/resume and actual GPU memory/throughput. Passing this smoke check does not establish that the future LLM implementation is bug-free.
