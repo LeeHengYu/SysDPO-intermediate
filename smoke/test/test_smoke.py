@@ -53,7 +53,10 @@ class SmokeChecks(unittest.TestCase):
                     choice = "option1" if pair in edges else "option2"
                     return completion(json.dumps({"choice": choice}))
 
-                with patch.object(train, "call_model", side_effect=fake_call) as api, \
+                with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                         patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
                         redirect_stdout(io.StringIO()):
                     train.main()
@@ -84,7 +87,10 @@ class SmokeChecks(unittest.TestCase):
                         choice = label if api.call_count == 3 + stop_at else "option1"
                         return completion(json.dumps({"choice": choice}))
 
-                    with patch.object(train, "call_model", side_effect=fake_call) as api, \
+                    with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                             patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
                             redirect_stdout(io.StringIO()):
                         train.main()
@@ -177,7 +183,7 @@ class SmokeChecks(unittest.TestCase):
         with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
                 patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
                              client_class(transport=httpx.MockTransport(handler), **kwargs)):
-            result = model_api.call_model("model", [{"role": "user", "content": "x"}])
+            result = model_api.call_gen("model", [{"role": "user", "content": "x"}])
         self.assertEqual(result, raw)
         self.assertEqual(model_api.response_text(result), "answer")
         self.assertEqual(handler.call_count, 1)
@@ -194,7 +200,7 @@ class SmokeChecks(unittest.TestCase):
                     patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
                                  client_class(transport=httpx.MockTransport(handler), **kwargs)):
                 with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
-                    model_api.call_model("model", [{"role": "user", "content": "x"}])
+                    model_api.call_gen("model", [{"role": "user", "content": "x"}])
             self.assertEqual(handler.call_count, 1)
 
     def test_invalid_responses(self):
@@ -241,7 +247,10 @@ class SmokeChecks(unittest.TestCase):
             def fake_call(model, messages, **settings):
                 return raw if settings.get("json_output") else completion(f"y{api.call_count}")
 
-            with patch.object(train, "call_model", side_effect=fake_call) as api, \
+            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
                     redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as failure:
@@ -266,9 +275,7 @@ class SmokeChecks(unittest.TestCase):
         with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
                 patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
                              client_class(transport=httpx.MockTransport(handler), **kwargs)):
-            result = model_api.call_model("microsoft/microsoft-decision-1", [
-                {"role": "system", "content": "Compare quality"},
-                {"role": "user", "content": '{"candidate_1":"a","candidate_2":"b"}'}], json_output=True)
+            result = model_api.call_judge({"candidate_1": "a", "candidate_2": "b"}, "Compare quality")
         self.assertEqual(result, raw)
         self.assertEqual(handler.call_count, 1)
         request = handler.call_args.args[0]
@@ -277,11 +284,12 @@ class SmokeChecks(unittest.TestCase):
         self.assertEqual(set(payload), {"model", "state", "questions"})
         self.assertEqual(payload["state"], {"candidate_1": "a", "candidate_2": "b"})
         self.assertEqual(payload["questions"]["preference"]["instructions"], "Compare quality")
-        self.assertEqual(set(payload["questions"]["preference"]["criteria"]), {"option1", "option2", "tie"})
+        self.assertEqual(set(payload["questions"]["preference"]["criteria"]), {"option1", "option2"})
         self.assertEqual(json.loads(model_api.response_text(result)), {"choice": "option2"})
-        raw["answers"]["preference"]["choice"] = "unknown"
-        with self.assertRaises(ValueError):
-            model_api.response_text(raw)
+        for choice in ("unknown", "tie"):
+            raw["answers"]["preference"]["choice"] = choice
+            with self.assertRaises(ValueError):
+                model_api.response_text(raw)
 
     def test_ten_questions_and_cache(self):
         def fake_call(model, messages, **settings):
@@ -300,7 +308,10 @@ class SmokeChecks(unittest.TestCase):
             rows = [{"id": i, "question": f"question {i}", "system": "",
                      "chosen": "chosen", "rejected": "rejected"} for i in range(10)]
             train.save_json(output / "dataset.json", {"rows": rows})
-            with patch.object(train, "call_model", side_effect=fake_call) as api, \
+            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", ["train.py", "--output-dir", str(output)]), \
                     redirect_stdout(io.StringIO()):
                 train.main()
@@ -348,7 +359,8 @@ class SmokeChecks(unittest.TestCase):
             wrong_pair = IntermediatePreference(**{**preferences[0], "y_rejected": "not a scored candidate"})
             with self.assertRaisesRegex(ValueError, "Rejected intermediate"):
                 compute_saved_losses(score_path, requests, [wrong_pair])
-            with patch.object(train, "call_model", side_effect=AssertionError("Unexpected API call")), \
+            with patch.object(train, "call_gen", side_effect=AssertionError("Unexpected API call")), \
+                    patch.object(train, "call_judge", side_effect=AssertionError("Unexpected judge call")), \
                     patch("sys.argv", ["train.py", "--output-dir", str(output), "--scores", str(score_path)]), \
                     redirect_stdout(io.StringIO()) as terminal:
                 train.main()
@@ -389,7 +401,10 @@ class SmokeChecks(unittest.TestCase):
                 return completion(f"sample {api.call_count}")
 
             argv = ["train.py", "--questions", "1", "--output-dir", str(output), "--scores", str(scores)]
-            with patch.object(train, "call_model", side_effect=fake_call) as api, \
+            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", argv), redirect_stdout(io.StringIO()) as terminal:
                 with self.assertRaises(SystemExit) as result:
                     train.main()
@@ -426,7 +441,10 @@ class SmokeChecks(unittest.TestCase):
                     if stage == failure:
                         result["choices"][0]["finish_reason"] = "length"
                     return result
-                with patch.object(train, "call_model", side_effect=fake_call) as api, \
+                with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                         patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
                         redirect_stdout(io.StringIO()):
                     with self.assertRaises(SystemExit):
@@ -462,7 +480,10 @@ class SmokeChecks(unittest.TestCase):
                 self.assertIn("original system", messages[0]["content"])
                 return completion(str(api.call_count))
             argv = ["train.py", "--questions", "1", "--prompt-file", str(custom), "--output-dir", str(output)]
-            with patch.object(train, "call_model", side_effect=fake_call) as api, \
+            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                                     api(model, [{"role": "system", "content": rubric},
+                                                 {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", argv), redirect_stdout(io.StringIO()):
                 train.main()
                 request = json.loads((output / "scoring_requests.json").read_text())[0]

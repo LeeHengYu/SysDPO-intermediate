@@ -14,7 +14,7 @@ import random
 from datasets import load_dataset
 from pydantic import TypeAdapter
 
-from model_api import call_model, response_text
+from model_api import call_gen, call_judge, response_text
 from likelihood import LAMBDA_A, compute_saved_losses
 from topo_sort import topological_sort
 from schemas import (
@@ -108,7 +108,11 @@ def recorded_call(output_dir, row_id, stage, model, messages, **settings):
     save_json(path, {**record, "error": "Request started; response not yet saved"})
 
     try:
-        record["response"] = call_model(model, messages, **settings)
+        if settings.get("json_output", False):
+            record["response"] = call_judge(
+                json.loads(messages[1]["content"]), messages[0]["content"], model=model)
+        else:
+            record["response"] = call_gen(model, messages, **settings)
     except Exception as error:
         record["error"] = type(error).__name__ + ": " + str(error)
         save_json(path, record)
@@ -240,7 +244,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "calls").mkdir(exist_ok=True)
 
-    config = {"workflow_version": 9, "questions": args.questions, "max_tokens": args.max_tokens,
+    config = {"workflow_version": 11, "questions": args.questions, "max_tokens": args.max_tokens,
               "generation_temperature": 0.3,
               "lambda_A": LAMBDA_A,
               "prompts": asdict(prompts), "generator": GENERATOR, "judge": JUDGE}

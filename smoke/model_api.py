@@ -7,26 +7,34 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError, ResponseValidationError
 
 
-def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output=False):
+def call_gen(model, messages, *, temperature=0.3, max_tokens=8192):
+    """Generate an intermediate for API smoke runs; GPU training generates with A."""
+    return request_model(lambda client: client.chat.send(
+        model=model, messages=messages, temperature=temperature,
+        max_tokens=max_tokens, stream=False))
+
+
+def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1"):
+    """Judge an intermediate pair independently of how A generated it.
+
+    state contains candidate_1, candidate_2 and their task context.
+    Returns the raw Decisions response, including choice and usage.
+    """
+    questions = {"preference": {
+        "type": "choice", "instructions": rubric,
+        "criteria": {
+            "option1": "candidate_1 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
+            "option2": "candidate_2 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
+        }}}
+    return request_model(lambda client: client.alpha.decisions.create(
+        model=model, state=state, questions=questions))
+
+
+def request_model(send):
+    """Shared SDK transport; one invocation makes one HTTP attempt."""
     key = os.environ.get("OPENROUTER_KEY")
     if not key:
         raise RuntimeError("OPENROUTER_KEY is not available in this process")
-
-    payload = {"model": model, "messages": messages, "temperature": temperature,
-               "max_tokens": max_tokens, "stream": False}
-    if json_output:
-        payload["response_format"] = {"type": "json_object"}
-        payload["reasoning"] = {"enabled": False}
-
-    if model == "microsoft/microsoft-decision-1":
-        payload = {"model": model, "state": json.loads(messages[1]["content"]),
-                   "questions": {"preference": {
-                       "type": "choice", "instructions": messages[0]["content"],
-                       "criteria": {
-                           "option1": "candidate_1 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
-                           "option2": "candidate_2 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
-                           "tie": "Neither candidate has a clear advantage in correctness, completeness, required output format, downstream usefulness, or conciseness, or the preference cannot be assessed reliably.",
-                       }}}}
 
     # Capture the raw JSON so SDK parsing cannot drop provider or usage metadata.
     responses = []
@@ -34,10 +42,7 @@ def call_model(model, messages, *, temperature=0.3, max_tokens=8192, json_output
         with httpx.Client(event_hooks={"response": [responses.append]}) as http_client:
             with OpenRouter(api_key=key, client=http_client, retry_config=None,
                             timeout_ms=600_000) as client:
-                if model == "microsoft/microsoft-decision-1":
-                    client.alpha.decisions.create(**payload)
-                else:
-                    client.chat.send(**payload)
+                send(client)
                 result = responses[-1].json()
     except ResponseValidationError as error:
         result = error.raw_response.json()
@@ -57,7 +62,7 @@ def response_text(result, *, allow_truncated=False):
 
     if "answers" in result:
         answer = result["answers"]["preference"]
-        if answer.get("type") != "choice" or answer.get("choice") not in ("option1", "option2", "tie"):
+        if answer.get("type") != "choice" or answer.get("choice") not in ("option1", "option2"):
             raise ValueError("Invalid Decisions preference answer")
         usage = result.get("usage", {})
         if any(type(usage.get(name)) is not int or usage[name] < 0
