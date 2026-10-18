@@ -159,6 +159,18 @@ def save_checkpoint(models, optimizer, scheduler, config, state, directory, rank
     return directory
 
 
+def restore_rng(state, rank, device):
+    rng_states = state.get("rank_rng_states") or [state]
+    if rank < len(rng_states):
+        rng = rng_states[rank]
+        torch.set_rng_state(rng["torch_rng"])
+        random.setstate(rng["python_rng"])
+        if device == "cuda" and rng["cuda_rng"]:
+            # Older checkpoints used two visible GPUs on one node.
+            source_device = rng.get("cuda_device", rank % len(rng["cuda_rng"]))
+            torch.cuda.set_rng_state(rng["cuda_rng"][source_device])
+
+
 def train_collection(base, collection, work, durable, config, resume=None, previous=None, device="cuda"):
     parallel = dist.is_initialized()
     rank = dist.get_rank() if parallel else 0
@@ -202,13 +214,7 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
         state = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        rng_states = state.get("rank_rng_states") or [state]
-        if rank < len(rng_states):
-            rng = rng_states[rank]
-            torch.set_rng_state(rng["torch_rng"])
-            random.setstate(rng["python_rng"])
-            if device == "cuda" and rng["cuda_rng"]:
-                torch.cuda.set_rng_state_all(rng["cuda_rng"])
+        restore_rng(state, rank, device)
 
     work.mkdir(parents=True, exist_ok=True)
     copies = []
@@ -239,7 +245,8 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
                 print(f"rows={done}/{len(requests)} step={step} loss={loss:.6f} pairs={pair_count} workers={world_size}", flush=True)
             if done % config.checkpoint_rows == 0 or done == len(requests):
                 rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
-                       "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else []}
+                       "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else [],
+                       "cuda_device": torch.cuda.current_device() if device == "cuda" else None}
                 rank_rng_states = [None] * world_size if rank == 0 else None
                 if parallel:
                     dist.gather_object(rng, rank_rng_states, dst=0)

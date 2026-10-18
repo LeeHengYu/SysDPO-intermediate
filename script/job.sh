@@ -2,8 +2,10 @@
 #SBATCH --account=research
 #SBATCH --partition=gpuh
 #SBATCH --qos=qos_research
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=8
+#SBATCH --nodes=1-2
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-task=h100:1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
 
@@ -15,48 +17,17 @@ round=${3:?round directory required}
 previous=${4:-}
 code=${5:?deployed source directory required}
 max_tokens=${6:-1024}
-scratch="/mnt/slurm_scratch/job_${SLURM_JOB_ID:?Slurm job required}"
-test -d "$scratch"
 
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4
-export HF_HOME="$scratch/huggingface" TMPDIR="$scratch"
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
 
-python="$code/.venv/bin/python"
+# Stage once per node; local scratch is not shared between nodes.
+srun --kill-on-bad-exit=1 --ntasks="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 \
+    bash "$code/script/worker.sh" prepare "$root" "$round" "$previous" "$code" "$max_tokens"
 
-mkdir -p "$scratch/base" "$scratch/collection"
-rsync -a "$root/models/Qwen1.5-1.8B-Chat/" "$scratch/base/"
-rsync -a "$round/" "$scratch/collection/" --exclude=checkpoints --exclude=logs
+srun --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --gpu-bind=none \
+    bash "$code/script/worker.sh" "$stage" "$root" "$round" "$previous" "$code" "$max_tokens"
 
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-
-checkpoint_args=()
-if [ -n "$previous" ]; then
-    rsync -a "$previous/" "$scratch/previous/"
-fi
-
-if [ "$stage" = collect ]; then
-    if [ -n "$previous" ]; then checkpoint_args=(--checkpoint "$scratch/previous"); fi
-
-    "$python" -m torch.distributed.run --standalone --nproc-per-node=2 -m multi_llm.collect --base "$scratch/base" \
-        --data "$scratch/collection/rows.json" --output "$scratch/collection/generated" \
-        --publish "$round" --max-tokens "$max_tokens" "${checkpoint_args[@]}"
-elif [ "$stage" = train ]; then
-    if [ -n "$previous" ]; then checkpoint_args=(--previous "$scratch/previous"); fi
-
-    resume=$(find "$round/checkpoints" -maxdepth 2 -name complete -type f 2>/dev/null | sort | tail -1 || true)
-    if [ -n "$resume" ]; then
-        rsync -a "$(dirname "$resume")/" "$scratch/resume/"
-        checkpoint_args=(--resume "$scratch/resume")
-    fi
-
-    "$python" -m torch.distributed.run --standalone --nproc-per-node=2 -m multi_llm.train --base "$scratch/base" \
-        --collection "$scratch/collection" --work "$scratch/checkpoints" \
-        --checkpoints "$round/checkpoints" --config "$scratch/collection/training_config.json" \
-        "${checkpoint_args[@]}"
-
+if [ "$stage" = train ]; then
     touch "$round/training.ready"
-else
-    echo "Unknown stage: $stage" >&2
-    exit 2
 fi

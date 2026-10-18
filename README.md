@@ -96,7 +96,7 @@ A run name is a directory name such as `train512`, not a Slurm job ID. An explic
 ~/.local/bin/uv run --no-sync python -u -m multi_llm.pipeline \
   --root /hpchome/hengyulee/sysdpo \
   --run next512 \
-  --from-run pilot512_continue \
+  --from-run train512 \
   --questions 512 \
   --round-size 512 \
   --max-tokens 1024 \
@@ -105,7 +105,7 @@ A run name is a directory name such as `train512`, not a Slurm job ID. An explic
 
 Use a new output run name. The source must have a completed training round and a durably published checkpoint. A/B adapters, optimizer and scheduler state are restored; base/reference weights remain fixed. Training configuration is inherited, and a conflicting `--config` is rejected. The chosen checkpoint is pinned in the new run's manifest.
 
-Automatic positioning advances by collected questions, including questions filtered out of training. For example, continuing from `pilot512_continue` starts at training-split position 1,536. `--questions all` then processes the remaining 10,680 questions. These positions are array offsets in `data/train.json`, not the dataset's row IDs.
+Automatic positioning advances by collected questions, including questions filtered out of training. These positions are array offsets in `data/train.json`, not the dataset's row IDs. Use `--questions all` to process the remaining questions.
 
 ## GPU stages and batching
 
@@ -119,7 +119,13 @@ Each collection round executes:
 
 Incomplete or empty candidate triples are excluded from training. Complete duplicate or cyclic triples retain system-scoring rows but supply no intermediate preference pairs. Inspect `judging_summary.json` for actual usable counts.
 
-`script/job.sh` requests two GPUs, eight CPUs and 64 GB host memory using account `research`, partition `gpuh` and QOS `qos_research`. It launches two workers with `torch.distributed.run`. The coordinator requests 30 hours for collection and four hours for training. Increasing collection size does not increase those time limits. The allocation remains held until the Slurm script exits, including checkpoint-copy completion.
+`script/job.sh` defaults to one GPU worker using account `research`, partition `gpuh` and QOS `qos_research`. Each task gets one H100 GPU and four CPUs; host memory is 64 GB per node. `script/worker.sh` stages inputs once per node, then `srun` launches the allocated Python workers with distributed rank and rendezvous settings. The coordinator requests 30 hours for collection and four hours for training. Increasing collection size does not increase those time limits. The allocation remains held until all workers finish and the Slurm script exits, including checkpoint-copy completion.
+
+For two GPU workers, set Slurm's standard `SBATCH_NTASKS=2` environment variable when starting the coordinator. The launcher permits one or two nodes and adapts staging and worker ranks to the actual allocation; this requires no change to the coordinator's Python code. A two-node placement uses 128 GB host memory total. Every stage in that coordinator inherits the setting.
+
+Worker count is fixed when the coordinator is invoked; it does not automatically downgrade from two GPUs to one. Set `SBATCH_NTASKS=1 SBATCH_NODES=1` to request one GPU on one node explicitly.
+
+Check the partition's node limit with `scontrol show partition gpuh`. If `MaxNodes=1`, both GPU workers must fit on the same node. Two-node execution requires a partition that permits it and has not been verified on this cluster.
 
 Collection-round size and optimizer batch size are independent. Default training configuration:
 
@@ -134,7 +140,7 @@ Collection-round size and optimizer batch size are independent. Default training
 | LoRA dropout | 0.05 |
 | Seed | 42 |
 
-The 64 rows are split across both GPUs, normally 32 each. Filtering and round boundaries can produce a smaller final update. A full batch supplies at most 192 intermediate preference pairs. Checkpoint intervals must be divisible by optimizer batch size; the final processed row is also checkpointed. RMSprop updates the adapters, and scheduler progress continues across collection rounds.
+The 64 rows are processed by one GPU or split across the allocated workers (normally 32 each with two GPUs). Filtering and round boundaries can produce a smaller final update. A full batch supplies at most 192 intermediate preference pairs. Checkpoint intervals must be divisible by optimizer batch size; the final processed row is also checkpointed. RMSprop updates the adapters, and scheduler progress continues across collection rounds.
 
 For a fresh run, provide a partial configuration JSON with `--config PATH`, for example:
 
@@ -169,48 +175,15 @@ sacct -j JOB_ID --format=JobID,State,ExitCode,Elapsed,AllocTRES
 
 ## Storage and recovery
 
-```text
-/hpchome/hengyulee/sysdpo/
-  current -> code/<release>/
-  code/<release>/.venv/
-  models/Qwen1.5-1.8B-Chat/
-  data/train.json
-  data/test.json
-  inputs.json
-  runs/<run>/
-    experiment.json
-    round_000/
-      rows.json
-      collection_config.json
-      question_<id>.json
-      tokens_<id>.json
-      calls/
-      judged_<id>.json
-      judging_summary.json
-      scoring_requests.json
-      intermediate_preferences.json
-      collect_job.json
-      train_job.json
-      collect_<job>.log
-      train_<job>.log
-      candidates.ready
-      preferences.ready
-      training.ready
-      checkpoints/rows_<count>/
-        A_adapter/
-        B_adapter/
-        training_state.pt
-        state.json
-        complete
-```
+Run artifacts live under `--root/runs/<run>/round_<index>/`. Checkpoints are stored in `checkpoints/rows_<count>/`, containing `A_adapter/`, `B_adapter/`, training state and metadata. Keep the base model and tokenizer under `--root/models/`; adapters alone cannot restore the models.
 
-GPU jobs stage base weights and round inputs into `/mnt/slurm_scratch/job_<JOB_ID>`. This is compute-node local disk, not RAM. Local snapshots are copied in a background thread to persistent `checkpoints/rows_<count>.partial/`, then published under the final name. Only final checkpoint directories with a `complete` marker are usable. Job exit waits for all pending transfers.
+GPU jobs use temporary node-local scratch and synchronize checkpoints to persistent storage before exiting. Only checkpoint directories with a `complete` marker and no `.partial` suffix are usable.
 
-Each checkpoint stores A/B adapters, optimizer/scheduler state, RNG states, processed-row position, data hash, configuration and base-model identity. Base model and tokenizer files remain under `models/`. A checkpoint alone does not replace those files.
+To recover an interrupted run, rerun its original CLI command with the same settings. Completed stages and successful API responses are reused. Training resumes from the latest complete checkpoint and requires the same GPU worker count. Use `--from-run NAME` with a new `--run` name to branch from a completed round; worker count may change between completed rounds.
 
-To resume an interrupted coordinator, rerun its original command with the same settings. Completed stages and successful API responses are reused. A resumed training stage restores its latest durable checkpoint and requires the same GPU worker count. At the lower-level training entry point, `--resume` means the same collection; `--previous` means a completed checkpoint from a prior collection.
+If a Slurm stage failed, inspect its log and scheduler state before removing its `collect_job.json` or `train_job.json` to allow resubmission. Reconcile a null job ID before resubmitting, and never resubmit an active job. Failed paid judge calls are retained and are not automatically retried.
 
-A failed Slurm stage stops the coordinator. Inspect its log and scheduler state before removing that stage's `collect_job.json` or `train_job.json` to resubmit it. If the recorded job ID is null, first reconcile whether submission reached Slurm. Do not resubmit an active job. Failed or interrupted paid judge calls are retained and are not automatically retried.
+Keep a `code/<release>/` directory while a coordinator or submitted job references it. Updating `current` does not change an already running coordinator's code. Run only one coordinator per run; it submits the GPU jobs itself.
 
 ## Source layout and checks
 

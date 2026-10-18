@@ -2,9 +2,11 @@
 from copy import deepcopy
 from pathlib import Path
 import json
+import random
 import shutil
 import unittest
 import uuid
+from unittest.mock import patch
 
 import torch
 from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
@@ -14,7 +16,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from safetensors.torch import load_file
 from peft import LoraConfig, get_peft_model
 
-from core.training import TrainingConfig, backward_row, copy_checkpoint, save_checkpoint, train_collection
+from core.training import TrainingConfig, backward_row, copy_checkpoint, restore_rng, save_checkpoint, train_collection
 from core.likelihood import preference_losses, score_request
 from core.schemas import ScoringRequest, IntermediatePreference
 from core.workflow import save_json
@@ -31,6 +33,17 @@ class TinyTokenizer:
 
 
 class OfflineTests(unittest.TestCase):
+    def test_cuda_rng_follows_worker_when_node_layout_changes(self):
+        first, second = torch.tensor([1], dtype=torch.uint8), torch.tensor([2], dtype=torch.uint8)
+        rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
+               "cuda_rng": [first, second]}
+        for saved, expected in ((rng, second),
+                                ({**rng, "cuda_rng": [first], "cuda_device": 0}, first)):
+            with self.subTest(saved_devices=len(saved["cuda_rng"])), \
+                    patch("core.training.torch.cuda.set_rng_state") as restore:
+                restore_rng({"rank_rng_states": [rng, saved]}, rank=1, device="cuda")
+                self.assertIs(restore.call_args.args[0], expected)
+
     def test_real_optimizer_resume_matches_uninterrupted(self):
         root = Path(__file__).parent / ("resume_test_" + uuid.uuid4().hex)
         base, collection = root / "base", root / "collection"
