@@ -13,7 +13,7 @@ rsync -az --exclude='.git' --exclude='.venv' --exclude='.uv-cache' \
     --exclude='.hf-cache' --exclude='*.egg-info' --exclude='build' --exclude='dist' --exclude='__pycache__' --exclude='runs' --exclude='.DS_Store' \
     --exclude='.env*' "$source_dir/" "$remote:$release/"
 
-ssh "$remote" bash "$release/multi-llm/setup.sh" "$root"
+ssh "$remote" bash "$release/script/setup.sh" "$root"
 
 ssh "$remote" ln -sfn "$release" "$root/current"
 

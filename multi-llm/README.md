@@ -3,12 +3,12 @@
 The Mac uploads source and dependency declarations. The management node creates its own Linux environment, downloads pinned inputs, runs parallel API judging, and submits offline GPU jobs. Do not copy the Mac `.venv`.
 
 ```sh
-bash multi-llm/deploy.sh
+bash script/deploy.sh
 ssh cuhk-compute '/hpchome/hengyulee/sysdpo/current/.venv/bin/python -m multi_llm.prepare --root /hpchome/hengyulee/sysdpo'
 ssh cuhk-compute '/hpchome/hengyulee/sysdpo/current/.venv/bin/python -u -m multi_llm.pipeline --root /hpchome/hengyulee/sysdpo --run pilot1024 --questions 1024 --workers 8'
 ```
 
-`deploy.sh` creates an immutable source release and updates `current` after dependencies install. GPU jobs receive the resolved release path, so a later upload cannot change their source. Each release has its own Linux `.venv`, so installing a new release does not change running jobs.
+`script/` contains `deploy.sh`, `setup.sh` and the Slurm entry point `job.sh`. `deploy.sh` creates an immutable source release and updates `current` after dependencies install. GPU jobs receive the resolved release path, so a later upload cannot change their source. Each release has its own Linux `.venv`, so installing a new release does not change running jobs.
 
 The judge reads `OPENROUTER_KEY`, or the private user file `~/.config/sysdpo/openrouter.json` containing that key. Credentials are excluded from deployments. Successful calls are cached; failed or interrupted paid calls are not automatically retried.
 

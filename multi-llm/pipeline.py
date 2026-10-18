@@ -25,7 +25,7 @@ def run_job(stage, root, directory, previous=None):
         if job_id is None:
             raise RuntimeError("Submission was interrupted; reconcile Slurm jobs before resubmitting")
     else:
-        script = Path(__file__).resolve().with_name("job.sh")
+        script = Path(__file__).resolve().parent.parent / "script" / "job.sh"
         save_json(job_file, {"job_id": None, "stage": stage, "code": str(script.parent.parent)})
         result = subprocess.run(["sbatch", "--parsable", "--time",
             "30:00:00" if stage == "collect" else "04:00:00", "--output", str(directory / f"{stage}_%j.log"),

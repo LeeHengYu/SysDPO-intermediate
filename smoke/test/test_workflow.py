@@ -105,6 +105,10 @@ class WorkflowTests(unittest.TestCase):
         try:
             def command(args, **kwargs):
                 if args[0] == "sbatch":
+                    script = Path(__file__).resolve().parents[2] / "script" / "job.sh"
+                    self.assertEqual(args[args.index("--output") + 2], str(script))
+                    self.assertTrue(script.is_file())
+                    self.assertEqual(args[-1], str(script.parent.parent))
                     self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
                     self.assertIsNone(json.loads((root / f"{stage}_job.json").read_text())["job_id"])
                     self.assertEqual(args[args.index("--time") + 1],
