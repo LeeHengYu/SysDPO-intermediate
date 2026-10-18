@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import runpy
-import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -17,12 +16,11 @@ import httpx
 
 from pydantic import TypeAdapter, ValidationError
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import model_api
-import train
-from likelihood import compute_saved_losses
-from schemas import DatasetRow, IntermediatePreference, Judgment, Prompts, QuestionRecord, ScoringRequest
+from core import model_api
+from smoke import train
+from core import workflow
+from core.likelihood import compute_saved_losses
+from core.schemas import DatasetRow, IntermediatePreference, Judgment, Prompts, QuestionRecord, ScoringRequest
 
 
 def completion(text):
@@ -53,8 +51,8 @@ class SmokeChecks(unittest.TestCase):
                     choice = "option1" if pair in edges else "option2"
                     return completion(json.dumps({"choice": choice}))
 
-                with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                         patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
@@ -87,8 +85,8 @@ class SmokeChecks(unittest.TestCase):
                         choice = label if api.call_count == 3 + stop_at else "option1"
                         return completion(json.dumps({"choice": choice}))
 
-                    with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                    with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                             patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
@@ -149,7 +147,7 @@ class SmokeChecks(unittest.TestCase):
     def test_entry_point(self):
         with patch("sys.argv", ["train.py", "--help"]), redirect_stdout(io.StringIO()) as terminal:
             with self.assertRaises(SystemExit) as result:
-                runpy.run_path(train.__file__, run_name="__main__")
+                runpy.run_module("smoke.train", run_name="__main__")
         self.assertEqual(result.exception.code, 0)
         self.assertIn("--questions", terminal.getvalue())
 
@@ -247,8 +245,8 @@ class SmokeChecks(unittest.TestCase):
             def fake_call(model, messages, **settings):
                 return raw if settings.get("json_output") else completion(f"y{api.call_count}")
 
-            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+            with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
@@ -308,8 +306,8 @@ class SmokeChecks(unittest.TestCase):
             rows = [{"id": i, "question": f"question {i}", "system": "",
                      "chosen": "chosen", "rejected": "rejected"} for i in range(10)]
             train.save_json(output / "dataset.json", {"rows": rows})
-            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+            with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", ["train.py", "--output-dir", str(output)]), \
@@ -359,8 +357,8 @@ class SmokeChecks(unittest.TestCase):
             wrong_pair = IntermediatePreference(**{**preferences[0], "y_rejected": "not a scored candidate"})
             with self.assertRaisesRegex(ValueError, "Rejected intermediate"):
                 compute_saved_losses(score_path, requests, [wrong_pair])
-            with patch.object(train, "call_gen", side_effect=AssertionError("Unexpected API call")), \
-                    patch.object(train, "call_judge", side_effect=AssertionError("Unexpected judge call")), \
+            with patch.object(workflow, "call_gen", side_effect=AssertionError("Unexpected API call")), \
+                    patch.object(workflow, "call_judge", side_effect=AssertionError("Unexpected judge call")), \
                     patch("sys.argv", ["train.py", "--output-dir", str(output), "--scores", str(score_path)]), \
                     redirect_stdout(io.StringIO()) as terminal:
                 train.main()
@@ -379,7 +377,7 @@ class SmokeChecks(unittest.TestCase):
                 compute_saved_losses(score_path, requests, typed_preferences)
 
             # Invalid labels stay invalid on replay; no repair or repeated judge call.
-            with patch.object(train, "recorded_call", return_value='{"choice":"uncertain"}'):
+            with patch.object(workflow, "recorded_call", return_value='{"choice":"uncertain"}'):
                 with self.assertRaises(ValueError):
                     train.judge_pair(output, DatasetRow(**rows[0]), "a", "b", "judge_y", "y1", "y2",
                                      train.load_prompts(train.PROMPT_FILE))
@@ -401,8 +399,8 @@ class SmokeChecks(unittest.TestCase):
                 return completion(f"sample {api.call_count}")
 
             argv = ["train.py", "--questions", "1", "--output-dir", str(output), "--scores", str(scores)]
-            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+            with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", argv), redirect_stdout(io.StringIO()) as terminal:
@@ -441,8 +439,8 @@ class SmokeChecks(unittest.TestCase):
                     if stage == failure:
                         result["choices"][0]["finish_reason"] = "length"
                     return result
-                with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+                with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                         patch("sys.argv", ["train.py", "--questions", "1", "--output-dir", str(output)]), \
@@ -480,8 +478,8 @@ class SmokeChecks(unittest.TestCase):
                 self.assertIn("original system", messages[0]["content"])
                 return completion(str(api.call_count))
             argv = ["train.py", "--questions", "1", "--prompt-file", str(custom), "--output-dir", str(output)]
-            with patch.object(train, "call_gen", side_effect=fake_call) as api, \
-                        patch.object(train, "call_judge", side_effect=lambda state, rubric, model:
+            with patch.object(workflow, "call_gen", side_effect=fake_call) as api, \
+                        patch.object(workflow, "call_judge", side_effect=lambda state, rubric, model:
                                      api(model, [{"role": "system", "content": rubric},
                                                  {"role": "user", "content": json.dumps(state)}], json_output=True)), \
                     patch("sys.argv", argv), redirect_stdout(io.StringIO()):

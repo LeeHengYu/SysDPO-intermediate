@@ -13,7 +13,7 @@ import json
 import torch
 import torch.nn.functional as F
 
-from schemas import IntermediatePreference, ScoringRequest
+from core.schemas import IntermediatePreference, ScoringRequest
 
 
 LAMBDA_A = 0.5

@@ -1,2 +1,11 @@
 **/__pycache__
 **/runs
+**/*cache
+.venv
+
+/audit
+*.egg-info/
+build/
+dist/
+
+**/.DS_Store

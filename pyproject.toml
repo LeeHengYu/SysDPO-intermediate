@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sysdpo-extend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+packages = ["core", "smoke", "smoke.test", "multi_llm"]
+package-dir = {multi_llm = "multi-llm"}
+
+[tool.setuptools.dynamic]
+dependencies = {file = "requirements.txt"}
+
+[tool.setuptools.package-data]
+core = ["prompts.json", "LICENSE"]
+multi_llm = ["*.sh"]

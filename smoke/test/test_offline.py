@@ -1,0 +1,155 @@
+"""Real tiny Qwen/LoRA tests, requiring no model downloads or API calls."""
+from copy import deepcopy
+from pathlib import Path
+import json
+import shutil
+import unittest
+import uuid
+
+import torch
+from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from safetensors.torch import load_file
+from peft import LoraConfig, get_peft_model
+
+from core.training import TrainingConfig, backward_row, copy_checkpoint, save_checkpoint, train_collection
+from core.likelihood import preference_losses, score_request
+from core.schemas import ScoringRequest, IntermediatePreference
+from core.workflow import save_json
+
+
+class TinyTokenizer:
+    eos_token_id = 2
+
+    def apply_chat_template(self, messages, **kwargs):
+        return [1, 3, 4]
+
+    def encode(self, text, **kwargs):
+        return [5 + ord(char) % 20 for char in text]
+
+
+class OfflineTests(unittest.TestCase):
+    def test_real_optimizer_resume_matches_uninterrupted(self):
+        root = Path(__file__).parent / ("resume_test_" + uuid.uuid4().hex)
+        base, collection = root / "base", root / "collection"
+        base.mkdir(parents=True)
+        collection.mkdir()
+        try:
+            torch.manual_seed(7)
+            backend = Tokenizer(WordLevel({"[UNK]": 0, "[EOS]": 1, "question": 2,
+                "one": 3, "two": 4, "three": 5, "yes": 6, "no": 7}, unk_token="[UNK]"))
+            backend.pre_tokenizer = Whitespace()
+            tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend,
+                unk_token="[UNK]", eos_token="[EOS]", pad_token="[EOS]")
+            tokenizer.chat_template = "{% for m in messages %}{{ m['content'] }} {% endfor %}"
+            tokenizer.save_pretrained(base)
+            Qwen2ForCausalLM(Qwen2Config(vocab_size=8, hidden_size=16, intermediate_size=32,
+                num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2)).save_pretrained(base)
+            save_json(base / "provenance.json", {"revision": "tiny-test"})
+            original = {k: v.clone() for k, v in load_file(str(base / "model.safetensors")).items()}
+            messages = [{"role": "user", "content": "question"}]
+            requests = [ScoringRequest(id=i, a_messages=messages, intermediates=["one", "two", "three"],
+                b_messages=[messages] * 3, final_answers=["yes", "no"], candidate_mask=[True] * 3) for i in range(4)]
+            pairs = [IntermediatePreference(id=i, x="question", system="", a_messages=messages,
+                y_chosen="one", y_rejected="two", finish_reasons={}) for i in range(4)]
+            save_json(collection / "scoring_requests.json", requests)
+            save_json(collection / "intermediate_preferences.json", pairs)
+            config = TrainingConfig(optimizer_rows=1, checkpoint_rows=2, learning_rate=1e-3,
+                                    warmup_steps=0, rank=2, alpha=2, dropout=0.1)
+            full = train_collection(base, collection, root / "work", root / "full", config, device="cpu")
+            resumed = train_collection(base, collection, root / "work_resume", root / "resumed", config,
+                                       resume=root / "full" / "rows_000002", device="cpu")
+            for role in ("A", "B"):
+                weights = {k: v.clone() for k, v in load_file(str(full / f"{role}_adapter" / "adapter_model.safetensors")).items()}
+                restored = {k: v.clone() for k, v in load_file(str(resumed / f"{role}_adapter" / "adapter_model.safetensors")).items()}
+                for name in weights:
+                    torch.testing.assert_close(weights[name], restored[name], atol=0, rtol=0)
+                self.assertTrue(any(torch.count_nonzero(value) for name, value in weights.items() if "lora_B" in name))
+            for name, value in {k: v.clone() for k, v in load_file(str(base / "model.safetensors")).items()}.items():
+                torch.testing.assert_close(value, original[name], atol=0, rtol=0)
+        finally:
+            shutil.rmtree(root)
+
+    def test_replayed_gradient_matches_direct_with_dropout(self):
+        self.assert_replayed_gradients("cpu", torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA allocation required")
+    def test_replayed_gradient_matches_direct_on_cuda(self):
+        self.assert_replayed_gradients("cuda", torch.bfloat16)
+
+    def assert_replayed_gradients(self, device, dtype):
+        torch.manual_seed(4)
+        base = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16,
+            intermediate_size=32, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=2, attention_dropout=0.0)).to(device=device, dtype=dtype)
+        reference = deepcopy(base).eval().requires_grad_(False)
+        a = get_peft_model(deepcopy(base), LoraConfig(r=2, lora_alpha=2,
+            lora_dropout=0.1, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"))
+        b = deepcopy(a)
+        a.train()
+        b.train()
+        for model in (a, b):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        replay_a, replay_b = deepcopy(a), deepcopy(b)
+        tokenizer = TinyTokenizer()
+        messages = [{"role": "user", "content": "question"}]
+        request = ScoringRequest(id=0, a_messages=messages, intermediates=["ab", "cd", "ef"],
+            b_messages=[messages] * 3, final_answers=["yes", "no"], candidate_mask=[True] * 3)
+        pairs = [(0, 0, 1), (0, 0, 2), (0, 1, 2)]
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if device == "cuda" else None
+        scores = score_request(request, a, b, reference, reference, tokenizer, tokenizer)
+        direct = preference_losses({key: value.unsqueeze(0) for key, value in scores.items()}, pairs)
+        loss = direct["L_sys"] / 2 + direct["L_A_weighted"] * 3 / 5
+        loss.backward()
+        rng_after = torch.get_rng_state()
+        cuda_rng_after = torch.cuda.get_rng_state_all() if device == "cuda" else None
+        torch.set_rng_state(rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        replay_loss = backward_row(request, pairs, (replay_a, replay_b, reference), tokenizer,
+                                   2, 5, TrainingConfig())
+        self.assertAlmostEqual(replay_loss, loss.item(), places=6)
+        self.assertTrue(torch.equal(torch.get_rng_state(), rng_after))
+        if cuda_rng_after is not None:
+            self.assertTrue(all(torch.equal(x, y) for x, y in zip(torch.cuda.get_rng_state_all(), cuda_rng_after)))
+        for direct_model, replay_model in ((a, replay_a), (b, replay_b)):
+            for p, q in zip(direct_model.parameters(), replay_model.parameters()):
+                if p.requires_grad:
+                    torch.testing.assert_close(p.grad, q.grad, atol=2e-7, rtol=2e-4)
+        self.assertTrue(all(p.grad is None for p in reference.parameters()))
+
+    def test_checkpoint_publishes_only_after_copy_and_restores_state(self):
+        root = Path(__file__).parent / ("checkpoint_test_" + uuid.uuid4().hex)
+        root.mkdir()
+        try:
+            config = Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2)
+            a = get_peft_model(Qwen2ForCausalLM(config), LoraConfig(
+                r=2, target_modules=["q_proj"], task_type="CAUSAL_LM"))
+            b = deepcopy(a)
+            params = [p for model in (a, b) for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.RMSprop(params, lr=1e-3)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1)
+            sum(p.sum() for p in params).backward()
+            optimizer.step()
+            scheduler.step()
+            snapshot = save_checkpoint((a, b), optimizer, scheduler, TrainingConfig(),
+                                       {"rows_done": 256}, root / "scratch" / "rows_000256")
+            self.assertFalse((snapshot / "complete").exists())
+            durable = copy_checkpoint(snapshot, root / "durable")
+            self.assertTrue((durable / "complete").exists())
+            saved = torch.load(durable / "training_state.pt", weights_only=True)
+            self.assertEqual(saved["scheduler"], scheduler.state_dict())
+            self.assertTrue(torch.equal(saved["torch_rng"], torch.get_rng_state()))
+            self.assertEqual(json.loads((durable / "state.json").read_text())["rows_done"], 256)
+            with self.assertRaises(FileExistsError):
+                copy_checkpoint(snapshot, root / "durable")
+        finally:
+            shutil.rmtree(root)
+
+
+if __name__ == "__main__":
+    unittest.main()

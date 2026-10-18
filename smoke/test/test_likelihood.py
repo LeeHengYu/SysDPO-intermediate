@@ -3,17 +3,15 @@
 from copy import deepcopy
 import math
 from pathlib import Path
-import sys
 import unittest
 
 import torch
 from torch import nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from likelihood import LAMBDA_A, completion_logp, dpo_pair_loss, get_probs, preference_losses, score_request
-from train import accumulate_gradients, freeze
-from schemas import ScoringRequest
+from core.likelihood import LAMBDA_A, completion_logp, dpo_pair_loss, get_probs, preference_losses, score_request
+from core.workflow import accumulate_gradients, freeze
+from core.schemas import ScoringRequest
 
 
 QUESTIONS, MESSAGES, ANSWERS = 8, 4, 3
