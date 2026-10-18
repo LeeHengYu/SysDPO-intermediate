@@ -32,7 +32,7 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(round_size=size):
                     calls = []
 
-                    def fake_job(stage, project, directory, previous):
+                    def fake_job(stage, project, directory, previous, max_tokens):
                         calls.append((stage, directory, previous))
                         if stage == "train":
                             checkpoint = directory / "checkpoints" / "rows_000001"
@@ -41,7 +41,7 @@ class WorkflowTests(unittest.TestCase):
 
                     with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}), \
                             patch("multi_llm.pipeline.run_job", side_effect=fake_job), \
-                            patch("multi_llm.pipeline.judge_collection") as judge:
+                            patch("multi_llm.judge.judge_collection") as judge:
                         pipeline(root, f"rounds{size}", len(rows), 8, TrainingConfig(), size)
 
                     directory = root / "runs" / f"rounds{size}"
@@ -108,7 +108,8 @@ class WorkflowTests(unittest.TestCase):
                     script = Path(__file__).resolve().parents[2] / "script" / "job.sh"
                     self.assertEqual(args[args.index("--output") + 2], str(script))
                     self.assertTrue(script.is_file())
-                    self.assertEqual(args[-1], str(script.parent.parent))
+                    self.assertEqual(args[-2], str(script.parent.parent))
+                    self.assertEqual(args[-1], "512")
                     self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
                     self.assertIsNone(json.loads((root / f"{stage}_job.json").read_text())["job_id"])
                     self.assertEqual(args[args.index("--time") + 1],
@@ -120,8 +121,8 @@ class WorkflowTests(unittest.TestCase):
             with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}), \
                     patch("multi_llm.pipeline.subprocess.run", side_effect=command) as submitted:
                 for stage in ("train", "collect"):
-                    run_job(stage, root, root)
-                    run_job(stage, root, root)
+                    run_job(stage, root, root, max_tokens=512)
+                    run_job(stage, root, root, max_tokens=512)
             self.assertEqual(submitted.call_count, 4)
             self.assertEqual(json.loads((root / "train_job.json").read_text())["job_id"], "123")
         finally:

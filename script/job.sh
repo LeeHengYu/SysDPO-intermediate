@@ -14,6 +14,7 @@ root=${2:?project root required}
 round=${3:?round directory required}
 previous=${4:-}
 code=${5:?deployed source directory required}
+max_tokens=${6:-1024}
 scratch="/mnt/slurm_scratch/job_${SLURM_JOB_ID:?Slurm job required}"
 test -d "$scratch"
 
@@ -39,7 +40,7 @@ if [ "$stage" = collect ]; then
 
     "$python" -m torch.distributed.run --standalone --nproc-per-node=2 -m multi_llm.collect --base "$scratch/base" \
         --data "$scratch/collection/rows.json" --output "$scratch/collection/generated" \
-        --publish "$round" "${checkpoint_args[@]}"
+        --publish "$round" --max-tokens "$max_tokens" "${checkpoint_args[@]}"
 elif [ "$stage" = train ]; then
     if [ -n "$previous" ]; then checkpoint_args=(--previous "$scratch/previous"); fi
 
