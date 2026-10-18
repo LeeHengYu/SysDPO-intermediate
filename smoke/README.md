@@ -9,7 +9,7 @@
 | `schemas.py` | Pydantic dataclasses for prompts, dataset rows, judgments, preferences and scoring/collection records |
 | `model_api.py` | Stateless API calls and response validation |
 | `core/prompts.json` | Editable A/B instructions, instruction policy and intermediate-judge rubric |
-| `test/test_likelihood.py`, `test/test_smoke.py` | Numerical model fixtures and offline workflow checks |
+| `../tests/` | Shared component and production workflow tests; API smoke runs are not tested |
 
 These repeated interfaces use attributes (`row.question`, `judgment.choice`, `request.intermediates`). [Pydantic dataclasses](https://docs.pydantic.dev/latest/concepts/dataclasses/) validate the fields, and `TypeAdapter` reads/writes their JSON representation. Saved files and raw provider responses remain JSON objects. Existing cached dataset/call files are preserved; cached dataset rows are now validated too. Invalid text, unsupported classifier labels, unknown prompt/judgment fields and mismatched scoring-request hashes fail validation. Requests are copied and revalidated when scoring or evaluating saved scores, so later field or nested-list edits cannot silently reuse a stale hash. Duplicate candidates are recorded as a local discard reason without a judge call. Tensor score/loss dictionaries remain unchanged.
 
@@ -123,26 +123,24 @@ If external score loading or validation fails, the run saves `loss_evaluation_fa
 
 Terminal reporting follows the procedural SysDPO pattern: running header, example/sample counts, per-question collection progress, separate system/auxiliary/total losses, chosen/rejected reference-relative log scores (`final_reward_w/l`), and token totals. The latter scores follow the release's unscaled logging convention; multiply by beta for the implicit DPO reward. Pending scores are explicitly marked. Resuming uses cached calls; usage describes all saved calls rather than only new requests in that invocation. Provider routing is not pinned.
 
-## Verification
+## Shared component tests
+
+The API smoke runner has no automated tests. Shared interfaces, numerical losses, offline training, collection/judging and CLI behavior are tested under `tests/`, beside `core/`.
 
 ```sh
-uv run --active python -m unittest smoke.test.test_smoke
-uv run --active python -m unittest smoke.test.test_likelihood
-uv run --active python -m smoke.train --help
+uv run --active --no-sync python -m unittest discover -s tests -t .
 ```
 
-Offline tests cover dataclass validation and JSON/cache compatibility, the 10-question/60-call collection/cache, no final generation, all six B scoring combinations, context-dependent B scores, failed intermediate judgments, incomplete candidates, exact prompt preservation, prompt/configuration protection, request mutation and score-file binding, scoring-failure accounting, completion/EOS masking, masked nonfinite logits, fixed-reference gradient exclusion, system gradients to A/B, auxiliary gradients to A only, and fixed auxiliary weighting. Fixtures use mock API responses or tiny numerical models, not real Qwen likelihoods. `uv pip` installs dependencies from `sysdpo-extend/requirements.txt` into the repository `.venv`: Torch, Pydantic, Hugging Face Datasets, OpenRouter, and HTTPX. Dataset collection uses `datasets.load_dataset("Intel/orca_dpo_pairs", split="train", streaming=True)` and reads only the requested number of rows; existing `dataset.json` caches remain usable. Install the repository with `uv pip install --python .venv/bin/python -e .`, then run the package entry points below. Imports do not modify process paths.
+## Numerical gradient checks
 
-## Numerical gradient smoke check
-
-The numerical models and training assertions live in `test_likelihood.py`. Production workflow modules contain no toy model definitions. The chosen/rejected log-ratio margin and `main_loss = -F.logsigmoid(beta * main_inside)` calculation are adapted from the pinned source above. Attribution and its license are preserved in `likelihood.py` and `LICENSE`.
+The numerical models and training assertions live in `tests/test_likelihood.py`. Production workflow modules contain no toy model definitions. The chosen/rejected log-ratio margin and `main_loss = -F.logsigmoid(beta * main_inside)` calculation are adapted from the pinned source above. Attribution and its license are preserved in `likelihood.py` and `LICENSE`.
 
 The smoke-specific changes add fixed auxiliary weighting and independent system/intermediate batch normalization. The reference models remain frozen. Likelihoods stay in log space, so the finite-state test does not need the source's exp/log conversion or nonfinite-value replacement. This is a small adaptation of the loss path, not a copy of the full LLM training pipeline.
 
 Run from the project root (CPU, no model downloads or paid API calls):
 
 ```sh
-uv run --active python -m unittest smoke.test.test_likelihood
+uv run --active --no-sync python -m unittest tests.test_likelihood
 ```
 
 The numerical training fixture implements:
@@ -171,4 +169,4 @@ uv run --active python -m multi_llm.train --base /local/Qwen1.5-1.8B-Chat \
 
 Install `requirements-gpu.txt` for this path. `offline.py` loads Qwen and independent LoRA adapters, computes real teacher-forced losses, performs RMSprop updates, and saves resumable checkpoints with background synchronization. Its inputs are the same scoring/preference exports used by the API smoke. The original `train.py --questions ...` API smoke remains a zero-update collection mode.
 
-See [the Linux workflow](../multi-llm/README.md) for model downloads, offline DBS collection, parallel judging, Slurm submission and checkpoint recovery. The numerical smoke remains distinct from real model training.
+See [the Linux workflow](../README.md) for model downloads, offline DBS collection, parallel judging, Slurm submission and checkpoint recovery. The API smoke remains distinct from real model training.

@@ -1,6 +1,7 @@
 """Offline checks for concurrent judging and durable stage handoff."""
 from pathlib import Path
 from datetime import timedelta
+from itertools import permutations, product
 import json
 import os
 from subprocess import CompletedProcess
@@ -17,10 +18,23 @@ from multi_llm.pipeline import pipeline, run_job
 from core.training import TrainingConfig
 from core.schemas import DatasetRow, Judgment, QuestionRecord
 from core.distributed import distributed_job
+from core.topo_sort import topological_sort
 from core.workflow import PROMPT_FILE, load_prompts, model_messages, save_json
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_three_candidate_graph_accepts_exactly_acyclic_preferences(self):
+        names = ("y1", "y2", "y3")
+        for directions in product((False, True), repeat=3):
+            edges = [(b, a) if reverse else (a, b)
+                     for (a, b), reverse in zip((("y1", "y2"), ("y1", "y3"), ("y2", "y3")), directions)]
+            expected = any(all(order.index(a) < order.index(b) for a, b in edges)
+                           for order in permutations(names))
+            with self.subTest(edges=edges):
+                self.assertEqual(topological_sort(edges), expected)
+        self.assertTrue(topological_sort([]))
+        self.assertFalse(topological_sort([("y1", "y1")]))
+
     def test_configurable_collection_rounds_and_checkpoint_handoff(self):
         root = Path(__file__).parent / ("round_test_" + uuid.uuid4().hex)
         (root / "data").mkdir(parents=True)
@@ -105,7 +119,7 @@ class WorkflowTests(unittest.TestCase):
         try:
             def command(args, **kwargs):
                 if args[0] == "sbatch":
-                    script = Path(__file__).resolve().parents[2] / "script" / "job.sh"
+                    script = Path(__file__).resolve().parents[1] / "script" / "job.sh"
                     self.assertEqual(args[args.index("--output") + 2], str(script))
                     self.assertTrue(script.is_file())
                     self.assertEqual(args[-2], str(script.parent.parent))

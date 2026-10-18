@@ -217,7 +217,7 @@ Checked implementation items have been implemented; the validation section disti
 
 Downloaded inputs: Qwen revision `e482ee3f73c375a627a16fdf66fd0c8279743ca6`; Orca revision `624952e3f420ae18d88b31977ee2ea436c833abb`. There are 12,859 rows, split with seed 42 into 12,216 training and 643 test rows.
 
-Entry points and operational instructions: [multi-llm/README.md](multi-llm/README.md). Completed deployments and test artifacts stay under `/hpchome/hengyulee/sysdpo/`.
+Entry points and operational instructions: [README.md](README.md). Completed deployments and test artifacts stay under `/hpchome/hengyulee/sysdpo/`.
 
 Cluster instructions: [AI Hub HPC user guide](https://github.com/CUHK-Business-School-AI-Hub/ai_hub_HPC_user_guide). Confirm account-specific limits and filesystem behavior at initial setup.
 

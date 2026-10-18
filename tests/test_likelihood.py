@@ -2,7 +2,6 @@
 
 from copy import deepcopy
 import math
-from pathlib import Path
 import unittest
 
 import torch
@@ -92,7 +91,7 @@ def zero_grad(a, b):
     b.zero_grad(set_to_none=True)
 
 
-def run_numerical_smoke():
+def check_numerical_training():
     torch.manual_seed(7)
     torch.set_num_threads(1)
     a, b = Producer(), Receiver()
@@ -280,7 +279,7 @@ class LikelihoodChecks(unittest.TestCase):
         torch.testing.assert_close(b.grad, source_b.grad)
 
     def test_numerical_training_and_accumulation(self):
-        run_numerical_smoke()
+        check_numerical_training()
 
     def test_completion_mask_and_eos(self):
         model, tokenizer = ModelFixture(), TokenizerFixture()
