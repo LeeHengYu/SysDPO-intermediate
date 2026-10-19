@@ -7,13 +7,11 @@ marginalization, completion/EOS masking and independent intermediate loss.
 """
 
 from dataclasses import asdict
-import hashlib
-import json
 
 import torch
 import torch.nn.functional as F
 
-from core.schemas import IntermediatePreference, ScoringRequest
+from core.schemas import ScoringRequest
 
 
 LAMBDA_A = 0.5
@@ -145,39 +143,3 @@ def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0
             "final_reward_w": (policy[:, 0] - reference[:, 0]).mean(),
             "final_reward_l": (policy[:, 1] - reference[:, 1]).mean(),
             "N": n, "M": len(pairs)}
-
-
-def compute_saved_losses(path, requests: list[ScoringRequest], intermediate: list[IntermediatePreference]):
-    """Evaluate actual supplied scores, never substitute judge scores for logp."""
-    requests = [ScoringRequest(**asdict(request)) for request in requests]
-
-    source = json.loads(path.read_text())
-    if source.get("reduction") not in ("sum", "mean") or source.get("include_eos") is not True:
-        raise ValueError("Score file must declare reduction=sum/mean and include_eos=true")
-
-    rows = source["rows"]
-    by_id = {row["id"]: row for row in rows}
-    if len(by_id) != len(rows) or set(by_id) != {r.id for r in requests}:
-        raise ValueError("Score rows must exactly match the scoring-ready question IDs")
-    for request in requests:
-        if by_id[request.id].get("request_sha256") != request.request_sha256:
-            raise ValueError("Scores do not match exact prompts/completions")
-
-    scores = {key: torch.tensor([by_id[r.id][key] for r in requests], dtype=torch.float64)
-              for key in ("a", "b", "a_ref", "b_ref")}
-    indices = {r.id: i for i, r in enumerate(requests)}
-    pairs = []
-    for pair in intermediate:
-        i = indices[pair.id]
-        chosen = requests[i].intermediates.index(pair.y_chosen)
-        if pair.y_rejected not in requests[i].intermediates:
-            raise ValueError("Rejected intermediate does not match the scoring request")
-        rejected = requests[i].intermediates.index(pair.y_rejected)
-        pairs.append((i, chosen, rejected))
-
-    mask = torch.tensor([r.candidate_mask for r in requests], dtype=torch.bool)
-    losses = preference_losses(scores, pairs, mask)
-    return {**{key: value.item() if torch.is_tensor(value) else value for key, value in losses.items()},
-            "status": "loss_evaluated_no_weight_updates", "reduction": source["reduction"],
-            "include_eos": True, "scores_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "lambda_A": LAMBDA_A}

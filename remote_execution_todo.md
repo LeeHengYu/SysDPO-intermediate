@@ -9,7 +9,7 @@
 - A and B both start from `Qwen/Qwen1.5-1.8B-Chat`, matching SysDPO's multi-LLM training script. They have independent trainable LoRA adapters; identical base weights/tokenizer files can share one persistent download.
 - Collection size: 1,024 dataset questions per frozen A snapshot, with three candidates per question. This is separate from inference batch size, optimizer batch size, and gradient accumulation.
 - Each training job processes that 1,024-row collection. Save a checkpoint after every 256 processed question rows and copy it to `/hpchome/<user>` using a background thread while training continues. The four checkpoints do not start new collection rounds or refresh the frozen references.
-- Generate candidates with SysDPO's Diverse Beam Search (DBS), adapted from two to three candidates: `num_beams=3`, `num_beam_groups=3`, `num_return_sequences=3`, `diversity_penalty=10.0`, `do_sample=False`. Temperature 0.3 from API smoke sampling is not used in this GPU decoding path.
+- Generate candidates with SysDPO's Diverse Beam Search (DBS), adapted from two to three candidates: `num_beams=3`, `num_beam_groups=3`, `num_return_sequences=3`, `diversity_penalty=10.0`, `do_sample=False`.
 - Dataset: `Intel/orca_dpo_pairs`; confirm the exact downloaded revision and row count, expected approximately 12.9k. Establish the training/evaluation split before collection.
 - Judge: `microsoft/microsoft-decision-1` through OpenRouter on the management node. Only `option1` and `option2` are available; confidence does not weight the loss.
 - Loss: `L_total = L_sys + 0.5 * L_A`; both DPO betas currently 0.5. A receives both terms; B receives only the system term.
@@ -45,7 +45,7 @@ Subsequently installed `uv` 0.13.0 using the [official installer](https://docs.a
 
 ### Experiment configuration prepared locally
 
-- [x] Pin the exact `Qwen/Qwen1.5-1.8B-Chat` checkpoint/tokenizer revision for both A and B. The smoke API's Qwen2.5-7B is not the remote training model.
+- [x] Pin the exact `Qwen/Qwen1.5-1.8B-Chat` checkpoint/tokenizer revision for both A and B.
 - [x] Select LoRA rank, alpha, dropout, and target modules by referring to the local SysDPO configuration. Record any changes necessary for our chosen models.
 - [x] Prepare a pinned train/test split, prompt grouping/order, learning rate and initial sequence limits in configuration files; no separate validation set is used. Choose effective optimizer and inference batch sizes after the GPU pilot.
 - [x] Prepare dependency versions and the agreed DBS configuration locally; verify grouped DBS support in the remote environment and pin the version that passes. Keep decoding settings constant during the experiment.
@@ -54,7 +54,7 @@ Subsequently installed `uv` 0.13.0 using the [official installer](https://docs.a
 
 - [x] Prepare a small `deploy.sh` using `rsync` over SSH, with remote host and directory as arguments.
 - [x] Have the local script execute remote setup commands through `ssh`: create the persistent directories, run management-node checks, and invoke an uploaded setup script. It must be runnable from this Mac without manually copying files or entering each setup command remotely.
-- [x] Upload code, prompt/configuration files, dependency declarations, and submission scripts. Exclude the Mac `.venv`, caches, credentials, model weights, and smoke-run artifacts by default.
+- [x] Upload code, prompt/configuration files, dependency declarations, and submission scripts. Exclude the Mac `.venv`, caches, credentials, model weights, and run artifacts by default.
 - [x] Preserve remote model/data/run directories on subsequent deployments; do not use deletion against the whole remote project tree.
 - [x] Record the deployed source version or file hashes in each experiment. Keep running jobs on a stable deployed copy when newer code is uploaded.
 - [x] Create a Linux `.venv` on the management node with `uv`; install packages there. A macOS virtual environment must not be copied for execution on Linux.
@@ -128,7 +128,7 @@ The [cluster scratch-space guide](https://github.com/CUHK-Business-School-AI-Hub
 - [x] Reuse SysDPO's grouped DBS generation pattern with three beams/groups/returned sequences and diversity penalty 10.0. Save the decoding configuration in the manifest; do not inherit the upstream hard-coded two-candidate reference generation.
 - [x] Check EOS/completion status and retained candidate IDs. DBS can still produce duplicate or near-equivalent outputs, so retain the existing duplicate and preference-cycle checks. Select a sufficient generation limit from the pilot rather than blindly adopting SysDPO's 200-token default.
 - [x] Save exact texts, dataset system instruction/question, `z_chosen`, `z_rejected`, completion status, token counts, prompts, row/candidate IDs, and collection checkpoint identity.
-- [x] Preserve partial outputs for inspection; exclude incomplete triples from normal scoring/label collection, as in the existing smoke workflow. Do not silently truncate the task or candidate.
+- [x] Preserve partial outputs for inspection; exclude incomplete triples from normal scoring/label collection. Do not silently truncate the task or candidate.
 - [x] Resume already saved candidates rather than regenerate a completed collection on restart.
 - [x] Write `candidates.ready` only after validating the completed collection manifest and outputs and copying them from scratch to persistent storage.
 - [x] Add `job.sh` collection stage with the cluster's resource settings, repository environment activation, local model paths, and log locations.
@@ -156,7 +156,7 @@ Loss routing:
 
 The system score combines differentiable current A scores of each `y_i` with current B scores of each dataset answer conditioned on that `y_i`, then marginalizes over candidates. Thus final-answer preferences can adjust both adapters. Intermediate DPO uses only A's current/reference scores; B is absent from this term. Base weights and initial references stay frozen. Judge calls and saved candidate generation are outside autograd; teacher-forced likelihoods are recomputed during training.
 
-- [x] Add an actual model-loading and optimizer path; the real training path is `core/training.py`; `smoke/train.py` remains API collection only.
+- [x] Add actual model loading and optimizer updates in `core/training.py`.
 - [x] Restore base A/B plus the previous round's adapters and optimizer/scheduler state. Keep the optimizer step count continuous across rounds.
 - [x] Load fixed references with their initial adapter state or the base-only configuration. Never overwrite reference adapters with current adapters.
 - [x] Compute differentiable current A likelihoods of saved candidates and current B likelihoods of dataset chosen/rejected answers conditioned on each candidate. No generated final `z` is needed for this loss.

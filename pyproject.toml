@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dynamic = ["dependencies"]
 
 [tool.setuptools]
-packages = ["core", "smoke", "tests", "multi_llm", "script"]
+packages = ["core", "tests", "multi_llm", "script"]
 package-dir = {multi_llm = "multi-llm"}
 
 [tool.setuptools.dynamic]

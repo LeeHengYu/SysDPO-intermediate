@@ -1,4 +1,4 @@
-"""Shared schema and API transport checks; no smoke runner or network calls."""
+"""Shared schema and judge API transport checks without network calls."""
 
 import hashlib
 import json
@@ -15,10 +15,10 @@ from core import model_api, workflow
 from core.schemas import Judgment, Prompts, QuestionRecord, ScoringRequest
 
 
-def completion(text):
-    return {"model": "test-model", "choices": [{"message": {"content": text},
-                                                 "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+def decision(choice="option1"):
+    return {"model": "microsoft/microsoft-decision-1", "provider": "Azure",
+            "answers": {"preference": {"type": "choice", "choice": choice}},
+            "usage": {"input_tokens": 100, "output_tokens": 0, "cost": 0.0000042}}
 
 
 class InterfaceChecks(unittest.TestCase):
@@ -55,56 +55,42 @@ class InterfaceChecks(unittest.TestCase):
             self.assertIsNone(saved["intermediate_judgments"][0]["winner"])
 
     def test_api_interface(self):
-        raw = {**completion("answer"), "created": 0, "id": "test",
-               "object": "chat.completion", "system_fingerprint": None,
-               "provider": "test-provider"}
-        raw["choices"][0]["index"] = 0
-        raw["choices"][0]["message"]["role"] = "assistant"
-        raw["usage"]["cost"] = 0.001
+        raw = decision()
         client_class = httpx.Client
         handler = Mock(return_value=httpx.Response(200, json=raw))
         with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
                 patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
                              client_class(transport=httpx.MockTransport(handler), **kwargs)):
-            result = model_api.call_gen("model", [{"role": "user", "content": "x"}])
+            result = model_api.call_judge({"candidate_1": "a", "candidate_2": "b"}, "Compare quality")
         self.assertEqual(result, raw)
-        self.assertEqual(model_api.response_text(result), "answer")
+        self.assertEqual(json.loads(model_api.response_text(result)), {"choice": "option1"})
         self.assertEqual(handler.call_count, 1)
         request = handler.call_args.args[0]
-        self.assertEqual(str(request.url), "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(str(request.url), "https://openrouter.ai/api/alpha/decisions")
         payload = json.loads(request.content)
-        self.assertEqual(payload["messages"], [{"role": "user", "content": "x"}])
-        self.assertEqual(payload["max_tokens"], 8192)
-        self.assertEqual(payload["temperature"], 0.3)
-        for status in (429, 503):
+        self.assertEqual(payload["model"], "microsoft/microsoft-decision-1")
+
+        for status in (401, 429, 503):
             handler = Mock(return_value=httpx.Response(status, json={"error": {
                 "code": status, "message": "Unavailable"}}))
             with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
                     patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
                                  client_class(transport=httpx.MockTransport(handler), **kwargs)):
                 with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
-                    model_api.call_gen("model", [{"role": "user", "content": "x"}])
+                    model_api.call_judge({"candidate_1": "a", "candidate_2": "b"}, "Compare quality")
             self.assertEqual(handler.call_count, 1)
 
     def test_invalid_responses(self):
-        for result, error in (({}, KeyError), ({"choices": []}, IndexError),
-                              ({"choices": None}, TypeError)):
+        for result, error in (({}, KeyError), ({"answers": {}}, KeyError),
+                              ({"answers": None}, TypeError)):
             with self.assertRaises(error):
                 model_api.response_text(result)
-        for result in (completion(""), {**completion("answer"), "usage": {}}):
+        for result in (decision("tie"), {**decision(), "usage": {}}, {"error": "Unavailable"}):
             with self.assertRaises(ValueError):
                 model_api.response_text(result)
-        truncated = completion("partial")
-        truncated["choices"][0]["finish_reason"] = "length"
-        with self.assertRaises(ValueError):
-            model_api.response_text(truncated)
-        self.assertEqual(model_api.response_text(truncated, allow_truncated=True), "partial")
 
-    def test_sdk_schema_mismatch_keeps_raw_reply(self):
-        raw = {**completion("answer"), "created": "bad metadata", "id": "test",
-               "object": "chat.completion", "system_fingerprint": None}
-        raw["choices"][0]["index"] = 0
-        raw["choices"][0]["message"]["role"] = "assistant"
+    def test_judge_cache_keeps_raw_reply_and_request_hash(self):
+        raw = decision()
         client_class = httpx.Client
         handler = Mock(return_value=httpx.Response(200, json=raw))
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary, \
@@ -113,10 +99,18 @@ class InterfaceChecks(unittest.TestCase):
                              client_class(transport=httpx.MockTransport(handler), **kwargs)):
             output = Path(temporary)
             (output / "calls").mkdir()
-            messages = [{"role": "user", "content": "x"}]
-            self.assertEqual(workflow.recorded_call(output, 0, "y1", "model", messages), "answer")
-            self.assertEqual(json.loads((output / "calls/0_y1.json").read_text())["response"], raw)
-            self.assertEqual(workflow.recorded_call(output, 0, "y1", "model", messages), "answer")
+            messages = [{"role": "system", "content": "Compare quality"},
+                        {"role": "user", "content": json.dumps({"candidate_1": "a", "candidate_2": "b"})}]
+            settings = {"temperature": 0, "max_tokens": 512, "json_output": True}
+            request = {"model": workflow.JUDGE, "messages": messages, **settings}
+            expected_hash = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+            for _ in range(2):
+                result = workflow.recorded_call(output, 0, "judge_y1_y2", workflow.JUDGE, messages, **settings)
+                self.assertEqual(json.loads(result), {"choice": "option1"})
+
+            saved = json.loads((output / "calls/0_judge_y1_y2.json").read_text())
+            self.assertEqual(saved["response"], raw)
+            self.assertEqual(saved["request_sha256"], expected_hash)
             self.assertEqual(handler.call_count, 1)
 
     def test_decision_api_interface(self):

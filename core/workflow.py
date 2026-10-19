@@ -7,10 +7,9 @@ from pathlib import Path
 import random
 
 from pydantic import TypeAdapter
-from core.model_api import call_gen, call_judge, response_text
+from core.model_api import call_judge, response_text
 from core.schemas import DatasetRow, Judgment, Prompts
 
-GENERATOR = "qwen/qwen-2.5-7b-instruct"
 JUDGE = "microsoft/microsoft-decision-1"
 PROMPT_FILE = Path(__file__).with_name("prompts.json")
 
@@ -69,7 +68,7 @@ def recorded_call(output_dir, row_id, stage, model, messages, **settings):
             raise ValueError("Cached request changed; use another output directory")
         if "error" in record:
             raise RuntimeError("Previous call failed; no automatic retry")
-        return response_text(record["response"], allow_truncated=not settings.get("json_output", False))
+        return response_text(record["response"])
 
     record = {"row_id": row_id, "stage": stage, "request_sha256": digest,
               "request": request, "created_utc": datetime.now(timezone.utc).isoformat()}
@@ -77,18 +76,15 @@ def recorded_call(output_dir, row_id, stage, model, messages, **settings):
     save_json(path, {**record, "error": "Request started; response not yet saved"})
 
     try:
-        if settings.get("json_output", False):
-            record["response"] = call_judge(
-                json.loads(messages[1]["content"]), messages[0]["content"], model=model)
-        else:
-            record["response"] = call_gen(model, messages, **settings)
+        record["response"] = call_judge(
+            json.loads(messages[1]["content"]), messages[0]["content"], model=model)
     except Exception as error:
         record["error"] = type(error).__name__ + ": " + str(error)
         save_json(path, record)
         raise
 
     save_json(path, record)  # Includes raw model/judge output, provider and usage.
-    return response_text(record["response"], allow_truncated=not settings.get("json_output", False))
+    return response_text(record["response"])
 
 
 

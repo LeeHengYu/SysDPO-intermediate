@@ -39,15 +39,6 @@ class Judgment:
 
 
 @dataclass(config=CONFIG)
-class SystemPreference:
-    id: StrictInt
-    x: Text
-    system: StrictStr
-    z_chosen: Text
-    z_rejected: Text
-
-
-@dataclass(config=CONFIG)
 class IntermediatePreference:
     id: StrictInt
     x: Text
