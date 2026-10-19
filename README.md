@@ -164,7 +164,7 @@ cd /hpchome/hengyulee/sysdpo/current
   --run next512 --status
 ```
 
-Status reports collection counts, filtering, judge calls and recorded API costs, scheduler states/runtimes, last logged batch loss, and durable checkpoint progress. Logged progress and saved progress can differ while synchronization runs. The command loads no model libraries or API credentials, submits no jobs and writes no experiment files. If Slurm is unavailable, saved results are still reported.
+Status reads up to eight rounds concurrently and prints each round's report in order. It reports collection counts, filtering, judge calls and recorded API costs, scheduler states/runtimes, last logged batch loss, and durable checkpoint progress. Logged progress and saved progress can differ while synchronization runs. The command loads no model libraries or API credentials, submits no jobs and writes no experiment files. If Slurm is unavailable, saved results are still reported.
 
 Direct scheduler commands:
 

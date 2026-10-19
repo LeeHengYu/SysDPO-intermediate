@@ -10,12 +10,14 @@ from subprocess import CompletedProcess
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Barrier, Event
 import unittest
 from unittest.mock import patch
 
 from core.training import TrainingConfig
 from core.workflow import save_json
 from multi_llm.pipeline import main, pipeline
+from multi_llm.status import read_round_status
 
 
 class PipelineCliTests(unittest.TestCase):
@@ -198,6 +200,36 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(query.call_args.args[0][0], "sacct")
         self.assertEqual(self.jobs, [])
         self.assertEqual({p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}, before)
+
+    def test_status_reads_rounds_concurrently_and_prints_in_order(self):
+        checkpoint = self.source_run()
+        first = checkpoint.parent.parent
+        second = first.parent / "round_001"
+        second.mkdir()
+        save_json(second / "rows.json", self.rows[6:8])
+        for current, cost in ((first, 0.01), (second, 0.02)):
+            (current / "calls").mkdir()
+            save_json(current / "calls/one.json", {"response": {"usage": {"cost": cost}}})
+
+        started = Barrier(2)
+        second_finished = Event()
+
+        def read_concurrently(current, *args):
+            started.wait(timeout=5)
+            report = read_round_status(current, *args)
+            if current == first:
+                self.assertTrue(second_finished.wait(timeout=5))
+            else:
+                second_finished.set()
+            return report
+
+        output = StringIO()
+        with patch("multi_llm.status.read_round_status", side_effect=read_concurrently), redirect_stdout(output):
+            main(["--root", str(self.root), "--run", "source", "--status"])
+
+        text = output.getvalue()
+        self.assertLess(text.index("\nround_000\n"), text.index("\nround_001\n"))
+        self.assertIn("Run API totals: attempted 2 | successful 2 | recorded cost $0.030000", text)
 
     def test_status_starts_without_torch_api_credentials_or_slurm(self):
         checkpoint = self.source_run()
