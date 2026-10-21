@@ -1,7 +1,8 @@
-"""Small, stateless OpenRouter interface. One invocation means one HTTP request."""
+"""Small, stateless OpenRouter interface with rate-limit retries."""
 
 import json
 import os
+import time
 import httpx
 from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError, ResponseValidationError
@@ -24,25 +25,31 @@ def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1"):
 
 
 def request_model(send):
-    """Shared SDK transport; one invocation makes one HTTP attempt."""
+    """Retry HTTP 429 after 30 seconds; propagate other transport failures."""
     key = os.environ.get("OPENROUTER_KEY")
     if not key:
         raise RuntimeError("OPENROUTER_KEY is not available in this process")
 
     # Capture the raw JSON so SDK parsing cannot drop provider or usage metadata.
-    responses = []
-    try:
-        with httpx.Client(event_hooks={"response": [responses.append]}) as http_client:
-            with OpenRouter(api_key=key, client=http_client, retry_config=None,
-                            timeout_ms=600_000) as client:
-                send(client)
-                result = responses[-1].json()
-    except ResponseValidationError as error:
-        result = error.raw_response.json()
-    except OpenRouterError as error:
-        raise RuntimeError(f"OpenRouter HTTP {error.status_code}") from None
-    except httpx.RequestError:
-        raise RuntimeError("OpenRouter connection failed or timed out") from None
+    while True:
+        responses = []
+        try:
+            with httpx.Client(event_hooks={"response": [responses.append]}) as http_client:
+                with OpenRouter(api_key=key, client=http_client, retry_config=None,
+                                timeout_ms=600_000) as client:
+                    send(client)
+                    result = responses[-1].json()
+        except ResponseValidationError as error:
+            result = error.raw_response.json()
+        except OpenRouterError as error:
+            if error.status_code == 429:
+                print("OpenRouter HTTP 429; retrying in 30 seconds", flush=True)
+                time.sleep(30)
+                continue
+            raise RuntimeError(f"OpenRouter HTTP {error.status_code}") from None
+        except httpx.RequestError:
+            raise RuntimeError("OpenRouter connection failed or timed out") from None
+        break
 
     if not isinstance(result, dict):
         raise RuntimeError("OpenRouter response is not an object")

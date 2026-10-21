@@ -102,6 +102,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_distributed_job_allows_long_shards_and_closes_on_failure(self):
         with patch.dict(os.environ, {"WORLD_SIZE": "2", "LOCAL_RANK": "1"}), \
+                patch("core.distributed.torch.cuda.device_count", return_value=2), \
                 patch("core.distributed.torch.cuda.set_device") as select, \
                 patch("core.distributed.dist.init_process_group") as initialize, \
                 patch("core.distributed.dist.destroy_process_group") as close:
@@ -112,6 +113,16 @@ class WorkflowTests(unittest.TestCase):
             select.assert_called_once_with(1)
             initialize.assert_called_once_with(backend="nccl", timeout=timedelta(hours=30))
             close.assert_called_once_with()
+
+    def test_slurm_worker_uses_its_single_visible_gpu(self):
+        with patch.dict(os.environ, {"WORLD_SIZE": "4", "LOCAL_RANK": "3",
+                                    "CUDA_VISIBLE_DEVICES": "7"}), \
+                patch("core.distributed.torch.cuda.device_count", return_value=1), \
+                patch("core.distributed.torch.cuda.set_device") as select, \
+                patch("core.distributed.dist.init_process_group"), \
+                patch("core.distributed.dist.destroy_process_group"):
+            with distributed_job():
+                select.assert_called_once_with(0)
 
     def test_submission_omits_api_key_and_reuses_completed_stage(self):
         root = Path(__file__).parent / ("submission_test_" + uuid.uuid4().hex)

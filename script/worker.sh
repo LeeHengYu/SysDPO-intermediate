@@ -7,6 +7,7 @@ round=${3:?round directory required}
 previous=${4:-}
 code=${5:?deployed source directory required}
 max_tokens=${6:-1024}
+workers=${7:-1}
 scratch="/mnt/slurm_scratch/job_${SLURM_JOB_ID:?Slurm job required}"
 test -d "$scratch"
 
@@ -33,18 +34,15 @@ if [ "$stage" = prepare ]; then
     exit 0
 fi
 
-export RANK=${SLURM_PROCID:?Slurm task required}
-export WORLD_SIZE=${SLURM_NTASKS:?Slurm task count required}
-export LOCAL_RANK=${SLURM_LOCALID:?Slurm local task required}
-
-echo "Worker rank=$RANK local_rank=$LOCAL_RANK node=$(hostname) devices=${CUDA_VISIBLE_DEVICES:-unset} master=$MASTER_ADDR:$MASTER_PORT"
+echo "Launcher node=$(hostname) devices=${CUDA_VISIBLE_DEVICES:-unset} workers=$workers"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
 checkpoint_args=()
 if [ "$stage" = collect ]; then
     if [ -n "$previous" ]; then checkpoint_args=(--checkpoint "$scratch/previous"); fi
 
-    exec "$python" -u -m multi_llm.collect --base "$scratch/base" \
+    exec "$python" -u -m torch.distributed.run --standalone --nproc-per-node="$workers" \
+        -m multi_llm.collect --base "$scratch/base" \
         --data "$scratch/collection/rows.json" --output "$scratch/collection/generated" \
         --publish "$round" --max-tokens "$max_tokens" "${checkpoint_args[@]}"
 elif [ "$stage" = train ]; then
@@ -53,7 +51,8 @@ elif [ "$stage" = train ]; then
         checkpoint_args=(--resume "$scratch/resume")
     fi
 
-    exec "$python" -u -m multi_llm.train --base "$scratch/base" \
+    exec "$python" -u -m torch.distributed.run --standalone --nproc-per-node="$workers" \
+        -m multi_llm.train --base "$scratch/base" \
         --collection "$scratch/collection" --work "$scratch/checkpoints" \
         --checkpoints "$round/checkpoints" --config "$scratch/collection/training_config.json" \
         "${checkpoint_args[@]}"

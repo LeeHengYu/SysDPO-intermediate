@@ -29,7 +29,7 @@ if os.environ["FAIL_WORKER"] == "1" and "prepare" not in sys.argv:
 ''')
             runner.chmod(0o755)
 
-            for nodes, tasks, fail in ((1, 1, False), (1, 2, False), (2, 2, False), (2, 2, True)):
+            for nodes, tasks, fail in ((1, 1, False), (1, 2, False), (1, 4, False), (1, 2, True)):
                 with self.subTest(nodes=nodes, tasks=tasks, fail=fail):
                     collection = root / f"round_{nodes}_{tasks}_{fail}"
                     collection.mkdir()
@@ -38,6 +38,7 @@ if os.environ["FAIL_WORKER"] == "1" and "prepare" not in sys.argv:
                            "SLURM_JOB_ID": "8695", "SLURM_JOB_NODELIST": "node[2-3]",
                            "SLURM_JOB_NUM_NODES": str(nodes), "LAUNCH_LOG": str(log),
                            "SLURM_NTASKS": str(tasks),
+                           "SLURM_CPUS_PER_TASK": "4",
                            "FAIL_WORKER": str(int(fail))}
                     result = subprocess.run(["bash", str(script), "train", str(root), str(collection),
                                              "previous", str(root), "1024"], env=env, capture_output=True)
@@ -45,9 +46,10 @@ if os.environ["FAIL_WORKER"] == "1" and "prepare" not in sys.argv:
                     calls = [json.loads(line) for line in log.read_text().splitlines()]
                     self.assertEqual(len(calls), 2)
                     self.assertIn(f"--ntasks={nodes}", calls[0]["args"])
-                    self.assertIn("--ntasks-per-node=1", calls[0]["args"])
                     self.assertIn("prepare", calls[0]["args"])
-                    self.assertIn(f"--ntasks={tasks}", calls[1]["args"])
+                    self.assertIn("--ntasks=1", calls[1]["args"])
+                    self.assertIn(f"--gpus-per-task=h100:{tasks}", calls[1]["args"])
+                    self.assertEqual(calls[1]["args"][-1], str(tasks))
                     self.assertIn("--gpu-bind=none", calls[1]["args"])
                     self.assertIn("--kill-on-bad-exit=1", calls[1]["args"])
                     self.assertTrue(all(call["master"] == "node2" and call["port"] == "28695"

@@ -2,7 +2,7 @@
 #SBATCH --account=research
 #SBATCH --partition=gpuh
 #SBATCH --qos=qos_research
-#SBATCH --nodes=1-2
+#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-task=h100:1
 #SBATCH --cpus-per-task=4
@@ -21,12 +21,15 @@ max_tokens=${6:-1024}
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
 
-# Stage once per node; local scratch is not shared between nodes.
-srun --kill-on-bad-exit=1 --ntasks="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 \
+test "$SLURM_JOB_NUM_NODES" -eq 1
+
+# One launcher sees all allocated GPUs; torchrun assigns one GPU to each worker.
+srun --kill-on-bad-exit=1 --ntasks=1 --gpus-per-task="h100:$SLURM_NTASKS" --gpu-bind=none \
     bash "$code/script/worker.sh" prepare "$root" "$round" "$previous" "$code" "$max_tokens"
 
-srun --kill-on-bad-exit=1 --ntasks="$SLURM_NTASKS" --gpu-bind=none \
-    bash "$code/script/worker.sh" "$stage" "$root" "$round" "$previous" "$code" "$max_tokens"
+srun --kill-on-bad-exit=1 --ntasks=1 --gpus-per-task="h100:$SLURM_NTASKS" \
+    --gpu-bind=none \
+    bash "$code/script/worker.sh" "$stage" "$root" "$round" "$previous" "$code" "$max_tokens" "$SLURM_NTASKS"
 
 if [ "$stage" = train ]; then
     touch "$round/training.ready"

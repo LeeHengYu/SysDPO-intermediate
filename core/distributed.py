@@ -12,7 +12,8 @@ def distributed_job(device="cuda"):
     parallel = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if parallel:
         if device == "cuda":
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+            local_device = 0 if torch.cuda.device_count() == 1 else int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_device)
         # DBS shards can finish far apart; allow the collection job's 30-hour limit.
         dist.init_process_group(backend="nccl" if device == "cuda" else "gloo",
                                 timeout=timedelta(hours=30))

@@ -70,7 +70,7 @@ class InterfaceChecks(unittest.TestCase):
         payload = json.loads(request.content)
         self.assertEqual(payload["model"], "microsoft/microsoft-decision-1")
 
-        for status in (401, 429, 503):
+        for status in (401, 503):
             handler = Mock(return_value=httpx.Response(status, json={"error": {
                 "code": status, "message": "Unavailable"}}))
             with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
@@ -79,6 +79,25 @@ class InterfaceChecks(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, f"HTTP {status}"):
                     model_api.call_judge({"candidate_1": "a", "candidate_2": "b"}, "Compare quality")
             self.assertEqual(handler.call_count, 1)
+
+    def test_rate_limit_waits_30_seconds_before_each_retry(self):
+        raw = decision()
+        client_class = httpx.Client
+        handler = Mock(side_effect=[
+            httpx.Response(429, json={"error": {"code": 429, "message": "Rate limited"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "Rate limited"}}),
+            httpx.Response(200, json=raw),
+        ])
+        with patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}), \
+                patch.object(model_api.httpx, "Client", side_effect=lambda **kwargs:
+                             client_class(transport=httpx.MockTransport(handler), **kwargs)), \
+                patch.object(model_api.time, "sleep") as sleep:
+            result = model_api.call_judge({"candidate_1": "a", "candidate_2": "b"}, "Compare quality")
+
+        self.assertEqual(result, raw)
+        self.assertEqual(handler.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(all(call.args == (30,) for call in sleep.call_args_list))
 
     def test_invalid_responses(self):
         for result, error in (({}, KeyError), ({"answers": {}}, KeyError),
