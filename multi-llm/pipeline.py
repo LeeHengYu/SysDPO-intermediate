@@ -6,13 +6,14 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import time
 
-from multi_llm.runs import continuation, latest_checkpoint, run_directory
+from multi_llm.runs import continuation, latest_checkpoint, prepare_training, run_directory
 
 
-def run_job(stage, root, directory, previous=None, max_tokens=1024):
+def run_job(stage, root, directory, previous=None, max_tokens=512):
     from core.workflow import save_json
 
     marker = directory / ("candidates.ready" if stage == "collect" else "training.ready")
@@ -58,7 +59,7 @@ def run_job(stage, root, directory, previous=None, max_tokens=1024):
 
 
 def pipeline(root, run, questions, workers, config=None, round_size=1024,
-             from_run=None, start_offset=None, max_tokens=1024):
+             from_run=None, start_offset=None, max_tokens=512):
     from multi_llm.judge import judge_collection
     from core.training import TrainingConfig
     from core.workflow import save_json
@@ -86,6 +87,12 @@ def pipeline(root, run, questions, workers, config=None, round_size=1024,
         config = config if config is not None else TrainingConfig(**(inherited or {}))
         if inherited is not None and asdict(config) != inherited:
             raise ValueError("Training configuration differs from source checkpoint")
+        ordering = saved
+        if ordering is None and from_run:
+            ordering = json.loads((run_directory(root, from_run) / "experiment.json").read_text())
+        shuffle = ordering.get("shuffle", False) if ordering is not None else True
+        if shuffle:
+            random.Random(config.seed).shuffle(dataset)
         start_offset = inferred_offset if start_offset is None else start_offset
         if start_offset < 0 or start_offset >= len(dataset):
             raise ValueError("Start offset must select a row in the training split")
@@ -96,9 +103,10 @@ def pipeline(root, run, questions, workers, config=None, round_size=1024,
 
         manifest = {"row_ids": [row["id"] for row in rows], "training": asdict(config),
                     "round_size": round_size, "start_offset": start_offset, "max_tokens": max_tokens,
-                    "from_run": from_run, "previous": str(previous) if previous else None}
+                    "from_run": from_run, "previous": str(previous) if previous else None, "shuffle": shuffle}
         if saved is not None:
-            saved = {"start_offset": 0, "max_tokens": 1024, "from_run": None, "previous": None, **saved}
+            saved = {"start_offset": 0, "max_tokens": 1024, "from_run": None, "previous": None,
+                     "shuffle": False, **saved}
             if saved != manifest:
                 raise ValueError("Existing experiment uses a different configuration")
 
@@ -108,6 +116,9 @@ def pipeline(root, run, questions, workers, config=None, round_size=1024,
 
         save_json(path, manifest)
         for offset in range(0, len(rows), round_size):
+            step = json.loads((previous / "state.json").read_text())["optimizer_steps"] if previous else 0
+            if step >= config.max_steps:
+                break
             current = directory / f"round_{offset // round_size:03d}"
             current.mkdir(exist_ok=True)
             save_json(current / "rows.json", rows[offset:offset + round_size])
@@ -117,6 +128,7 @@ def pipeline(root, run, questions, workers, config=None, round_size=1024,
             if not (current / "preferences.ready").exists():
                 judge_collection(current, workers)
 
+            prepare_training(current, previous)
             run_job("train", root, current, previous, max_tokens)
             previous = latest_checkpoint(current)
             if previous is None:
@@ -136,7 +148,7 @@ def main(argv=None):
     parser.add_argument("--config", type=Path)
     parser.add_argument("--from-run", help="Source run whose latest completed round supplies the checkpoint")
     parser.add_argument("--start-offset", type=int, help="Training-split position; inferred from --from-run otherwise 0")
-    parser.add_argument("--max-tokens", type=int, default=1024, help="Maximum new tokens per intermediate output")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Maximum new tokens per intermediate output")
     parser.add_argument("--status", action="store_true", help="Read saved progress and Slurm state without launching work")
 
     args = parser.parse_args(argv)

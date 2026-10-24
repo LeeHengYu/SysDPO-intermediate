@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import random
 
 
 def run_directory(root, run):
@@ -16,9 +17,39 @@ def latest_checkpoint(directory):
     return completed[-1].parent if completed else None
 
 
+def prepare_training(directory, previous=None):
+    """Prepend unused scored rows without regenerating candidates or judging again."""
+    from core.workflow import save_json
+
+    target = directory / "training"
+    if (target / "inputs.ready").exists():
+        return
+    requests, preferences = [], []
+    if previous:
+        state = json.loads((previous / "state.json").read_text())
+        if state["rows_done"] < state["total_rows"]:
+            source = previous.parent.parent / "training"
+            if not source.exists():
+                source = previous.parent.parent
+            requests = json.loads((source / "scoring_requests.json").read_text())[state["rows_done"]:]
+            ids = {row["id"] for row in requests}
+            preferences = [pair for pair in json.loads((source / "intermediate_preferences.json").read_text())
+                           if pair["id"] in ids]
+
+    requests += json.loads((directory / "scoring_requests.json").read_text())
+    preferences += json.loads((directory / "intermediate_preferences.json").read_text())
+    target.mkdir(exist_ok=True)
+    save_json(target / "scoring_requests.json", requests)
+    save_json(target / "intermediate_preferences.json", preferences)
+    (target / "inputs.ready").touch()
+
+
 def continuation(root, run, dataset, checkpoint=None):
     directory = run_directory(root, run)
     manifest = json.loads((directory / "experiment.json").read_text())
+    dataset = list(dataset)
+    if manifest.get("shuffle", False):
+        random.Random(manifest["training"]["seed"]).shuffle(dataset)
     rounds = sorted(directory.glob("round_*"))
 
     if checkpoint is None:
@@ -26,7 +57,8 @@ def continuation(root, run, dataset, checkpoint=None):
             candidate = latest_checkpoint(current)
             if candidate and (current / "training.ready").exists():
                 state = json.loads((candidate / "state.json").read_text())
-                if state["rows_done"] == state["total_rows"]:
+                if (state["rows_done"] == state["total_rows"]
+                        or state.get("stop_reason") in ("max_steps", "collection_remainder")):
                     checkpoint = candidate
                     break
         else:
@@ -36,7 +68,9 @@ def continuation(root, run, dataset, checkpoint=None):
     current = checkpoint.parent.parent
     state = json.loads((checkpoint / "state.json").read_text())
     if (current.parent != directory or not (checkpoint / "complete").exists()
-            or not (current / "training.ready").exists() or state["rows_done"] != state["total_rows"]):
+            or not (current / "training.ready").exists()
+            or (state["rows_done"] != state["total_rows"]
+                and state.get("stop_reason") not in ("max_steps", "collection_remainder"))):
         raise ValueError("Source checkpoint is not a completed training round")
 
     consumed = [row["id"] for item in rounds if item <= current

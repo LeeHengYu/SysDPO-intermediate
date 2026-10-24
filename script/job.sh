@@ -16,7 +16,7 @@ root=${2:?project root required}
 round=${3:?round directory required}
 previous=${4:-}
 code=${5:?deployed source directory required}
-max_tokens=${6:-1024}
+max_tokens=${6:-512}
 
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))

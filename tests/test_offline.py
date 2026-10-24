@@ -20,6 +20,7 @@ from core.training import TrainingConfig, backward_row, copy_checkpoint, restore
 from core.likelihood import preference_losses, score_request
 from core.schemas import ScoringRequest, IntermediatePreference
 from core.workflow import save_json
+from multi_llm.runs import prepare_training
 
 
 class TinyTokenizer:
@@ -69,11 +70,25 @@ class OfflineTests(unittest.TestCase):
                 y_chosen="one", y_rejected="two", finish_reasons={}) for i in range(4)]
             save_json(collection / "scoring_requests.json", requests)
             save_json(collection / "intermediate_preferences.json", pairs)
-            config = TrainingConfig(optimizer_rows=1, checkpoint_rows=2, learning_rate=1e-3,
+            config = TrainingConfig(max_steps=3, optimizer_rows=1, checkpoint_rows=2, learning_rate=1e-3,
                                     warmup_steps=0, rank=2, alpha=2, dropout=0.1)
             full = train_collection(base, collection, root / "work", root / "full", config, device="cpu")
             resumed = train_collection(base, collection, root / "work_resume", root / "resumed", config,
                                        resume=root / "full" / "rows_000002", device="cpu")
+            state = json.loads((full / "state.json").read_text())
+            self.assertEqual(state["optimizer_steps"], 3)
+            self.assertEqual(state["rows_done"], 3)
+            self.assertEqual(state["total_rows"], 4)
+            self.assertEqual(state["stop_reason"], "max_steps")
+            audits = [json.loads(path.read_text()) for path in sorted((root / "full/metrics").glob("*.json"))]
+            self.assertEqual([row["batch_rows"] for row in audits], [1, 1, 1])
+            for row in audits:
+                self.assertAlmostEqual(row["L_total"], row["L_sys"] + 0.5 * row["L_A"])
+            self.assertEqual(state["last_audit"], audits[-1])
+            with patch("core.training.load_models") as load:
+                self.assertEqual(train_collection(base, collection, root / "extra_work", root / "extra", config,
+                                                 resume=full, device="cpu"), full)
+                load.assert_not_called()
             for role in ("A", "B"):
                 weights = {k: v.clone() for k, v in load_file(str(full / f"{role}_adapter" / "adapter_model.safetensors")).items()}
                 restored = {k: v.clone() for k, v in load_file(str(resumed / f"{role}_adapter" / "adapter_model.safetensors")).items()}
@@ -82,6 +97,35 @@ class OfflineTests(unittest.TestCase):
                 self.assertTrue(any(torch.count_nonzero(value) for name, value in weights.items() if "lora_B" in name))
             for name, value in {k: v.clone() for k, v in load_file(str(base / "model.safetensors")).items()}.items():
                 torch.testing.assert_close(value, original[name], atol=0, rtol=0)
+
+            carry_config = TrainingConfig(max_steps=1, optimizer_rows=3, checkpoint_rows=3,
+                                          warmup_steps=0, rank=2, alpha=2)
+            first, second = root / "carry/round_000", root / "carry/round_001"
+            for stage, subset in ((first, slice(0, 2)), (second, slice(2, 4))):
+                stage.mkdir(parents=True)
+                save_json(stage / "scoring_requests.json", requests[subset])
+                save_json(stage / "intermediate_preferences.json", pairs[subset])
+            prepare_training(first)
+            pending = train_collection(base, first / "training", root / "work_pending",
+                                       first / "checkpoints", carry_config, device="cpu")
+            state = json.loads((pending / "state.json").read_text())
+            self.assertEqual(state["optimizer_steps"], 0)
+            self.assertEqual(state["rows_done"], 0)
+            self.assertEqual(state["stop_reason"], "collection_remainder")
+
+            prepare_training(second, pending)
+            prepare_training(second, pending)
+            merged = json.loads((second / "training/scoring_requests.json").read_text())
+            self.assertEqual([row["id"] for row in merged], [0, 1, 2, 3])
+            merged_pairs = json.loads((second / "training/intermediate_preferences.json").read_text())
+            self.assertEqual([row["id"] for row in merged_pairs], [0, 1, 2, 3])
+            final = train_collection(base, second / "training", root / "work_carry",
+                                     second / "checkpoints", carry_config, previous=pending, device="cpu")
+            state = json.loads((final / "state.json").read_text())
+            self.assertEqual(state["optimizer_steps"], 1)
+            self.assertEqual(state["rows_done"], 3)
+            self.assertEqual(state["total_rows"], 4)
+            self.assertEqual(state["last_audit"]["batch_rows"], 3)
         finally:
             shutil.rmtree(root)
 
@@ -124,7 +168,9 @@ class OfflineTests(unittest.TestCase):
             torch.cuda.set_rng_state_all(cuda_rng)
         replay_loss = backward_row(request, pairs, (replay_a, replay_b, reference), tokenizer,
                                    2, 5, TrainingConfig())
-        self.assertAlmostEqual(replay_loss, loss.item(), places=6)
+        self.assertAlmostEqual(replay_loss.L_total, loss.item(), places=6)
+        self.assertAlmostEqual(replay_loss.L_sys, direct["L_sys"].item() / 2, places=6)
+        self.assertAlmostEqual(replay_loss.L_A, direct["L_A"].item() * 3 / 5, places=6)
         self.assertTrue(torch.equal(torch.get_rng_state(), rng_after))
         if cuda_rng_after is not None:
             self.assertTrue(all(torch.equal(x, y) for x, y in zip(torch.cuda.get_rng_state_all(), cuda_rng_after)))

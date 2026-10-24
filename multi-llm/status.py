@@ -74,6 +74,9 @@ def read_round_status(current, jobs, states, optimizer_rows):
         state = json.loads((checkpoint / "state.json").read_text())
         report.lines.append(f"Durably saved: {state['rows_done']}/{state['total_rows']} rows | cumulative step {state['optimizer_steps']}")
         report.lines.append(f"Checkpoint: {checkpoint}")
+        if audit := state.get("last_audit"):
+            report.lines.append(f"Saved losses: L_sys {audit['L_sys']:.6f} | L_A {audit['L_A']:.6f} | "
+                                f"weighted L_A {audit['L_A_weighted']:.6f}")
 
     return report
 
@@ -98,7 +101,10 @@ def show_status(root, run):
 
     print(f"Run: {run}")
     print(f"Selected questions: {len(manifest['row_ids'])} | collection round size: {manifest['round_size']}")
-    print(f"Optimizer batch: {manifest['training']['optimizer_rows']} rows")
+    optimizer_rows = manifest["training"]["optimizer_rows"]
+    print(f"Optimizer batch: {optimizer_rows} rows")
+    if "max_steps" in manifest["training"]:
+        print(f"Optimizer budget: {manifest['training']['max_steps']} cumulative steps")
     if manifest.get("previous"):
         print(f"Starting checkpoint: {manifest['previous']}")
 
@@ -106,7 +112,7 @@ def show_status(root, run):
     total_cost = Decimal("0")
     with ThreadPoolExecutor(max_workers=8) as pool:
         reports = [pool.submit(read_round_status, current, jobs, states,
-                               manifest["training"]["optimizer_rows"]) for current in rounds]
+                               optimizer_rows) for current in rounds]
         for future in reports:
             report = future.result()
             print("\n".join(report.lines), flush=True)

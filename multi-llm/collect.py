@@ -17,7 +17,7 @@ from core.workflow import PROMPT_FILE, load_prompts, model_messages, save_json
 
 
 def collect(base, data, output, publish, offset=0, count=None, checkpoint=None,
-            prompt_file=PROMPT_FILE, max_tokens=1024, device="cuda"):
+            prompt_file=PROMPT_FILE, max_tokens=512, device="cuda"):
     parallel = dist.is_initialized()
     rank = dist.get_rank() if parallel else 0
     world_size = dist.get_world_size() if parallel else 1
@@ -112,7 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--count", type=int, help="Rows to collect; defaults to all remaining input rows")
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=512)
 
     args = parser.parse_args()
 

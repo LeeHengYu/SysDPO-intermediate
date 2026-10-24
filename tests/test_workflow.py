@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import timedelta
 from itertools import permutations, product
 import json
+import random
 import os
 from subprocess import CompletedProcess
 import shutil
@@ -54,16 +55,21 @@ class WorkflowTests(unittest.TestCase):
                             checkpoint = directory / "checkpoints" / "rows_000001"
                             checkpoint.mkdir(parents=True)
                             (checkpoint / "complete").touch()
+                            prior = json.loads((previous / "state.json").read_text())["optimizer_steps"] if previous else 0
+                            save_json(checkpoint / "state.json", {"optimizer_steps": prior + 1})
 
                     with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}), \
                             patch("multi_llm.pipeline.run_job", side_effect=fake_job), \
+                            patch("multi_llm.pipeline.prepare_training"), \
                             patch("multi_llm.judge.judge_collection") as judge:
                         pipeline(root, f"rounds{size}", len(rows), 8, TrainingConfig(), size)
 
                     directory = root / "runs" / f"rounds{size}"
                     rounds = sorted(directory.glob("round_*"))
                     selected = [json.loads((item / "rows.json").read_text()) for item in rounds]
-                    self.assertEqual([row for batch in selected for row in batch], rows)
+                    shuffled = list(rows)
+                    random.Random(TrainingConfig().seed).shuffle(shuffled)
+                    self.assertEqual([row for batch in selected for row in batch], shuffled)
                     self.assertEqual([len(batch) for batch in selected],
                                      [len(rows[offset:offset + size]) for offset in range(0, len(rows), size)])
                     self.assertEqual(judge.call_count, len(rounds))

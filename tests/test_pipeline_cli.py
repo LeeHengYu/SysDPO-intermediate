@@ -6,6 +6,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import random
 from subprocess import CompletedProcess
 import subprocess
 import sys
@@ -49,6 +50,7 @@ class PipelineCliTests(unittest.TestCase):
         for mocked in (
             patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}),
             patch("multi_llm.pipeline.run_job", side_effect=fake_job),
+            patch("multi_llm.pipeline.prepare_training"),
             patch("multi_llm.judge.judge_collection",
                   side_effect=lambda current, workers: (current / "preferences.ready").touch()),
         ):
@@ -126,14 +128,46 @@ class PipelineCliTests(unittest.TestCase):
         main(["--root", str(self.root), "--run", "offset_only", "--start-offset", "10",
               "--questions", "all"])
         selected = json.loads((self.root / "runs/offset_only/experiment.json").read_text())
-        self.assertEqual(selected["row_ids"], [20, 21])
+        shuffled = list(self.rows)
+        random.Random(TrainingConfig().seed).shuffle(shuffled)
+        self.assertEqual(selected["row_ids"], [row["id"] for row in shuffled[10:]])
 
     def test_legacy_manifest_can_resume_and_be_used_as_source(self):
         self.source_run(start=0, legacy=True)
         pipeline(self.root, "child", 2, 8, from_run="source")
         selected = json.loads((self.root / "runs/child/experiment.json").read_text())
         self.assertEqual(selected["start_offset"], 4)
-        pipeline(self.root, "source", 4, 8, self.config)
+        pipeline(self.root, "source", 4, 8, self.config, max_tokens=1024)
+
+    def test_shuffle_is_stable_for_resume_and_continuation(self):
+        pipeline(self.root, "shuffled", 4, 8, self.config, round_size=2)
+        path = self.root / "runs/shuffled/experiment.json"
+        manifest = json.loads(path.read_text())
+        shuffled = list(self.rows)
+        random.Random(self.config.seed).shuffle(shuffled)
+        self.assertEqual(manifest["row_ids"], [row["id"] for row in shuffled[:4]])
+        pipeline(self.root, "shuffled", 4, 8, self.config, round_size=2)
+        self.assertEqual(json.loads(path.read_text()), manifest)
+
+        pipeline(self.root, "next", 2, 8, from_run="shuffled")
+        child = json.loads((self.root / "runs/next/experiment.json").read_text())
+        self.assertEqual(child["row_ids"], [row["id"] for row in shuffled[4:6]])
+
+    def test_cap_stops_new_collection_and_pins_partial_terminal_checkpoint(self):
+        config = TrainingConfig(max_steps=2)
+        pipeline(self.root, "capped", "all", 8, config, round_size=2)
+        directory = self.root / "runs/capped"
+        self.assertEqual(len(list(directory.glob("round_*"))), 2)
+        self.assertEqual(len(self.jobs), 4)
+        terminal = directory / "round_001/checkpoints/rows_000001"
+        state = json.loads((terminal / "state.json").read_text())
+        state.update(rows_done=1, stop_reason="max_steps")
+        save_json(terminal / "state.json", state)
+        self.jobs.clear()
+        pipeline(self.root, "after_cap", "all", 8, from_run="capped")
+        child = json.loads((self.root / "runs/after_cap/experiment.json").read_text())
+        self.assertEqual(child["previous"], str(terminal))
+        self.assertEqual(self.jobs, [])
 
     def test_invalid_selections_and_changed_configuration_submit_nothing(self):
         self.source_run()
@@ -169,6 +203,9 @@ class PipelineCliTests(unittest.TestCase):
 
     def test_status_reports_saved_vs_logged_progress_without_writes(self):
         checkpoint = self.source_run()
+        state = json.loads((checkpoint / "state.json").read_text())
+        state["last_audit"] = {"L_sys": 0.6, "L_A": 0.4, "L_A_weighted": 0.2}
+        save_json(checkpoint / "state.json", state)
         current = checkpoint.parent.parent
         (current.parent / "round_001").mkdir()
         for stage, job in (("collect", "100"), ("train", "101")):
@@ -195,6 +232,7 @@ class PipelineCliTests(unittest.TestCase):
         self.assertIn("$0.010000", text)
         self.assertIn("rows 3/4 | cumulative step 13", text)
         self.assertIn("Durably saved: 2/2 rows | cumulative step 12", text)
+        self.assertIn("L_sys 0.600000 | L_A 0.400000 | weighted L_A 0.200000", text)
         self.assertIn("Cost is incomplete", text)
         self.assertIn("Preparing round metadata", text)
         self.assertEqual(query.call_args.args[0][0], "sacct")

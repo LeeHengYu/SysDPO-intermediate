@@ -54,7 +54,7 @@ For 512 questions in one collection round:
   --run train512 \
   --questions 512 \
   --round-size 512 \
-  --max-tokens 1024 \
+  --max-tokens 512 \
   --workers 8
 ```
 
@@ -68,7 +68,7 @@ nohup ~/.local/bin/uv run --no-sync python -u -m multi_llm.pipeline \
   --run full_train \
   --questions all \
   --round-size 512 \
-  --max-tokens 1024 \
+  --max-tokens 512 \
   --workers 8 \
   > /hpchome/hengyulee/sysdpo/full_train.coordinator.log 2>&1 < /dev/null &
 ```
@@ -83,7 +83,7 @@ nohup ~/.local/bin/uv run --no-sync python -u -m multi_llm.pipeline \
 | `--round-size N` | Questions collected from one frozen A snapshot before judging and training | `1024` |
 | `--from-run NAME` | Restore the latest completed training round of another run | None |
 | `--start-offset N` | Zero-based position in the saved training split | After source round, or `0` without a source |
-| `--max-tokens N` | Maximum new tokens per generated intermediate output | `1024` |
+| `--max-tokens N` | Maximum new tokens per generated intermediate output | `512` |
 | `--workers N` | Concurrent management-node judge calls | `8` |
 | `--config PATH` | Training settings as a JSON object | Defaults below, or inherited from source checkpoint |
 | `--status` | Read saved progress and Slurm state without launching work | Off |
@@ -99,7 +99,7 @@ A run name is a directory name such as `train512`, not a Slurm job ID. An explic
   --from-run train512 \
   --questions 512 \
   --round-size 512 \
-  --max-tokens 1024 \
+  --max-tokens 512 \
   --workers 8
 ```
 
@@ -131,7 +131,8 @@ Collection-round size and optimizer batch size are independent. Default training
 
 | Setting | Value |
 |---|---:|
-| Global rows per optimizer update | 64 |
+| Cumulative optimizer update budget | 70 |
+| Global usable rows per optimizer update | 64 |
 | Processed rows between checkpoints | 256 |
 | Learning rate | `6.4e-6` |
 | Warmup optimizer steps | 20 |
@@ -140,12 +141,21 @@ Collection-round size and optimizer batch size are independent. Default training
 | LoRA dropout | 0.05 |
 | Seed | 42 |
 
-The 64 rows are processed by one GPU or split across the allocated workers (normally 32 each with two GPUs). Filtering and round boundaries can produce a smaller final update. A full batch supplies at most 192 intermediate preference pairs. Checkpoint intervals must be divisible by optimizer batch size; the final processed row is also checkpointed. RMSprop updates the adapters, and scheduler progress continues across collection rounds.
+The selected dataset order is shuffled once using the training seed before collection; the manifest records that order and resumes reuse it. `--start-offset` addresses positions in this shuffled order. Continuing a legacy unshuffled run retains its original order.
+
+Each optimizer update uses exactly 64 usable question rows globally, split across GPU workers. Leftover rows from a collection round are prepended to the next round’s training inputs, together with their saved intermediate preferences; they are not regenerated or judged again. The merged inputs are saved in each round’s `training/` directory. Dataset exhaustion with fewer than 64 leftover rows produces no smaller update.
+
+The run stops at 70 cumulative updates, including the existing 20-step warmup. That uses 4,480 usable rows if enough are available, so the entire dataset need not be consumed. No further collection or judging is launched after the cap. A cap reached partway through a collection saves the actual `rows_done`, full input `total_rows`, and `stop_reason: max_steps`. RMSprop and scheduler state continue across rounds. Checkpoints are saved after an update crosses each 256-row boundary and at the end of a training stage, including stages that carry leftovers forward without an update.
+
+Per-update audit records in `checkpoints/metrics/step_<step>.json` contain raw `L_sys`, raw pair-averaged `L_A`, `L_A_weighted = 0.5 * L_A`, `L_total`, batch rows and pair counts. These are losses computed before that update. Checkpoint `state.json` also contains `last_audit`; stdout and `--status` expose the components. Metrics newer than the latest complete checkpoint are provisional and are overwritten if those updates are replayed.
+
+Use a fresh run name for this configuration. Historical checkpoints are not converted to the new capped, shuffled schedule, and their component losses cannot be recovered from total loss alone.
 
 For a fresh run, provide a partial configuration JSON with `--config PATH`, for example:
 
 ```json
 {
+  "max_steps": 70,
   "optimizer_rows": 64,
   "checkpoint_rows": 256,
   "learning_rate": 0.0000064,
@@ -175,7 +185,7 @@ sacct -j JOB_ID --format=JobID,State,ExitCode,Elapsed,AllocTRES
 
 ## Storage and recovery
 
-Run artifacts live under `--root/runs/<run>/round_<index>/`. Checkpoints are stored in `checkpoints/rows_<count>/`, containing `A_adapter/`, `B_adapter/`, training state and metadata. Keep the base model and tokenizer under `--root/models/`; adapters alone cannot restore the models.
+Run artifacts live under `--root/runs/<run>/round_<index>/`. Checkpoints are stored in `checkpoints/rows_<count>/`, containing `A_adapter/`, `B_adapter/`, training state and metadata. Keep the base model and tokenizer under `--root/models/`; adapters alone cannot restore the models. Keep round data and `training/` with checkpoints so continuation can recover unused rows.
 
 GPU jobs use temporary node-local scratch and synchronize checkpoints to persistent storage before exiting. Only checkpoint directories with a `complete` marker and no `.partial` suffix are usable.
 

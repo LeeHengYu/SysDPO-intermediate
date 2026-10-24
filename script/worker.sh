@@ -6,7 +6,7 @@ root=${2:?project root required}
 round=${3:?round directory required}
 previous=${4:-}
 code=${5:?deployed source directory required}
-max_tokens=${6:-1024}
+max_tokens=${6:-512}
 workers=${7:-1}
 scratch="/mnt/slurm_scratch/job_${SLURM_JOB_ID:?Slurm job required}"
 test -d "$scratch"
@@ -53,7 +53,7 @@ elif [ "$stage" = train ]; then
 
     exec "$python" -u -m torch.distributed.run --standalone --nproc-per-node="$workers" \
         -m multi_llm.train --base "$scratch/base" \
-        --collection "$scratch/collection" --work "$scratch/checkpoints" \
+        --collection "$scratch/collection/training" --work "$scratch/checkpoints" \
         --checkpoints "$round/checkpoints" --config "$scratch/collection/training_config.json" \
         "${checkpoint_args[@]}"
 else

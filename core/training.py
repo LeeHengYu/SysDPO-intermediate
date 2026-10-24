@@ -14,13 +14,14 @@ import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_constant_schedule_with_warmup
 from peft import LoraConfig, PeftModel, get_peft_model
 
-from core.likelihood import completion_logp, preference_losses, score_request
+from core.likelihood import LAMBDA_A, completion_logp, preference_losses, score_request
 from core.schemas import IntermediatePreference, ScoringRequest
 from core.workflow import save_json
 
 
 @dataclass
 class TrainingConfig:
+    max_steps: int = 70
     optimizer_rows: int = 64
     checkpoint_rows: int = 256
     learning_rate: float = 6.4e-6
@@ -33,16 +34,30 @@ class TrainingConfig:
     reduction: str = "mean"
 
     def __post_init__(self):
+        if self.max_steps < 1:
+            raise ValueError("Optimizer step budget must be positive")
         if self.optimizer_rows < 1 or self.checkpoint_rows < 1:
             raise ValueError("Row counts must be positive")
-        if self.checkpoint_rows % self.optimizer_rows:
-            raise ValueError("Optimizer rows must divide checkpoint rows")
         if self.learning_rate <= 0 or self.warmup_steps < 0:
             raise ValueError("Invalid learning rate or warmup")
         if self.beta <= 0 or self.rank < 1 or self.alpha < 1 or not 0 <= self.dropout < 1:
             raise ValueError("Invalid DPO or adapter parameters")
         if self.reduction not in ("mean", "sum"):
             raise ValueError("Unknown completion reduction")
+
+
+@dataclass
+class LossAudit:
+    L_sys: float = 0.0
+    L_A: float = 0.0
+
+    @property
+    def L_A_weighted(self):
+        return LAMBDA_A * self.L_A
+
+    @property
+    def L_total(self):
+        return self.L_sys + self.L_A_weighted
 
 
 def load_models(base, config, checkpoint=None, device="cuda"):
@@ -75,8 +90,8 @@ def read_training_rows(collection):
     preferences = TypeAdapter(list[IntermediatePreference]).validate_json(
         (collection / "intermediate_preferences.json").read_text())
     by_id = {row.id: row for row in requests}
-    if not requests or len(by_id) != len(requests):
-        raise ValueError("Training requires nonempty unique question IDs")
+    if len(by_id) != len(requests):
+        raise ValueError("Training requires unique question IDs")
     pairs = {row.id: [] for row in requests}
     for pair in preferences:
         row = by_id[pair.id]
@@ -130,7 +145,8 @@ def backward_row(request, pairs, models, tokenizer, system_count, pair_count, co
         torch.set_rng_state(final_cpu_rng)
         if final_cuda_rng is not None:
             torch.cuda.set_rng_state_all(final_cuda_rng)
-    return float(loss.detach())
+    return LossAudit(L_sys=float(losses["L_sys"].detach()) / system_count,
+                     L_A=float(losses["L_A"].detach()) * len(pairs) / pair_count if pair_count else 0.0)
 
 
 def copy_checkpoint(source, destination):
@@ -195,9 +211,17 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
             if saved["data_hash"] != data_hash:
                 raise ValueError("Resume data differs from checkpoint")
             start = saved["rows_done"]
-        elif saved["rows_done"] != saved["total_rows"]:
+        elif (saved["rows_done"] != saved["total_rows"]
+              and saved.get("stop_reason") != "collection_remainder"):
             raise ValueError("Previous collection is incomplete")
         step = saved["optimizer_steps"]
+
+    if step >= config.max_steps:
+        if resume:
+            return resume
+        raise ValueError("Optimizer step budget is exhausted")
+    updates = min((len(requests) - start) // config.optimizer_rows, config.max_steps - step)
+    end = start + updates * config.optimizer_rows
 
     torch.manual_seed(config.seed)
     random.seed(config.seed)
@@ -217,52 +241,73 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
         restore_rng(state, rank, device)
 
     work.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        (durable / "metrics").mkdir(parents=True, exist_ok=True)
     copies = []
     with ThreadPoolExecutor(max_workers=1) as worker:
-        for offset in range(start, len(requests), config.optimizer_rows):
+        def publish(done, loss, record):
+            rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
+                   "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else [],
+                   "cuda_device": torch.cuda.current_device() if device == "cuda" else None}
+            rank_rng_states = [None] * world_size if rank == 0 else None
+            if parallel:
+                dist.gather_object(rng, rank_rng_states, dst=0)
+            else:
+                rank_rng_states = [rng]
+            if rank == 0:
+                stop_reason = ("max_steps" if step >= config.max_steps else
+                               "collection_remainder" if done < len(requests) else "collection_complete")
+                snapshot = save_checkpoint((a, b), optimizer, scheduler, config,
+                    {"rows_done": done, "total_rows": len(requests), "optimizer_steps": step,
+                     "data_hash": data_hash, "base_identity": base_identity, "last_loss": loss,
+                     "last_audit": record, "stop_reason": stop_reason,
+                     "world_size": world_size}, work / f"rows_{done:06d}", rank_rng_states)
+                copies.append(worker.submit(copy_checkpoint, snapshot, durable))
+
+        for offset in range(start, end, config.optimizer_rows):
             for future in copies:
                 if future.done():
                     future.result()
-            batch = requests[offset:offset + config.optimizer_rows]
+            batch = requests[offset:min(offset + config.optimizer_rows, end)]
             pair_count = sum(len(pairs[row.id]) for row in batch)
             optimizer.zero_grad(set_to_none=True)
-            loss = sum(backward_row(row, pairs[row.id], (a, b, reference), tokenizer,
-                                    len(batch), pair_count, config) for row in batch[rank::world_size])
+            audit = LossAudit()
+            for row in batch[rank::world_size]:
+                contribution = backward_row(row, pairs[row.id], (a, b, reference), tokenizer,
+                                            len(batch), pair_count, config)
+                audit.L_sys += contribution.L_sys
+                audit.L_A += contribution.L_A
+
             if parallel:
                 for parameter in parameters:
                     if parameter.grad is None:
                         parameter.grad = torch.zeros_like(parameter)
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-                combined_loss = torch.tensor(loss, device=device, dtype=torch.float64)
+                combined_loss = torch.tensor([audit.L_sys, audit.L_A], device=device, dtype=torch.float64)
                 dist.all_reduce(combined_loss, op=dist.ReduceOp.SUM)
-                loss = combined_loss.item()
+                audit = LossAudit(*combined_loss.tolist())
+            loss = audit.L_total
             torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
             step += 1
             done = offset + len(batch)
+            record = {**asdict(audit), "L_A_weighted": audit.L_A_weighted, "L_total": loss,
+                      "lambda_A": LAMBDA_A, "step": step, "rows_done": done,
+                      "batch_rows": len(batch), "pairs": pair_count, "workers": world_size}
             if rank == 0:
-                print(f"rows={done}/{len(requests)} step={step} loss={loss:.6f} pairs={pair_count} workers={world_size}", flush=True)
-            if done % config.checkpoint_rows == 0 or done == len(requests):
-                rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
-                       "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else [],
-                       "cuda_device": torch.cuda.current_device() if device == "cuda" else None}
-                rank_rng_states = [None] * world_size if rank == 0 else None
-                if parallel:
-                    dist.gather_object(rng, rank_rng_states, dst=0)
-                else:
-                    rank_rng_states = [rng]
-                if rank == 0:
-                    snapshot = save_checkpoint((a, b), optimizer, scheduler, config,
-                        {"rows_done": done, "total_rows": len(requests), "optimizer_steps": step,
-                         "data_hash": data_hash, "base_identity": base_identity, "last_loss": loss,
-                         "world_size": world_size}, work / f"rows_{done:06d}", rank_rng_states)
-                    copies.append(worker.submit(copy_checkpoint, snapshot, durable))
+                save_json(durable / "metrics" / f"step_{step:06d}.json", record)
+                print(f"rows={done}/{len(requests)} step={step} loss={loss:.6f} pairs={pair_count} workers={world_size} "
+                      f"L_sys={audit.L_sys:.6f} L_A={audit.L_A:.6f} L_A_weighted={audit.L_A_weighted:.6f}", flush=True)
+            if done // config.checkpoint_rows > offset // config.checkpoint_rows or done == end:
+                publish(done, loss, record)
+        if start == end and not resume:
+            publish(end, None, None)
         for future in copies:
             future.result()
     if parallel:
         dist.barrier()
-    final = durable / f"rows_{len(requests):06d}"
+    final = durable / f"rows_{end:06d}"
     if not (final / "complete").exists():
         raise RuntimeError("Final durable checkpoint is missing")
     return final

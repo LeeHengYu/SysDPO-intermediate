@@ -136,10 +136,11 @@ def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0
 
         losses = dpo_pair_loss(a[rows, chosen], a[rows, rejected],
                               a_ref[rows, chosen], a_ref[rows, rejected], beta_a)
-        auxiliary = LAMBDA_A * losses.mean()
+        auxiliary = losses.mean()
 
     system = system_rows.mean()
-    return {"L_sys": system, "L_A_weighted": auxiliary, "L_total": system + auxiliary,
+    return {"L_sys": system, "L_A": auxiliary, "L_A_weighted": LAMBDA_A * auxiliary,
+            "L_total": system + LAMBDA_A * auxiliary,
             "final_reward_w": (policy[:, 0] - reference[:, 0]).mean(),
             "final_reward_l": (policy[:, 1] - reference[:, 1]).mean(),
             "N": n, "M": len(pairs)}

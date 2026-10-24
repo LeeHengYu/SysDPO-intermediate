@@ -331,6 +331,7 @@ class LikelihoodChecks(unittest.TestCase):
         self.assertGreater(b.grad.abs().sum(), 0)
         empty = preference_losses(scores, [])
         self.assertEqual(empty["M"], 0)
+        self.assertEqual(empty["L_A"].item(), 0)
         self.assertEqual(empty["L_A_weighted"].item(), 0)
         with self.assertRaises(ValueError):
             preference_losses(scores, [(0, 0, 0)])
