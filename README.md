@@ -185,6 +185,29 @@ If a Slurm stage failed, inspect its log and scheduler state before removing its
 
 Keep a `code/<release>/` directory while a coordinator or submitted job references it. Updating `current` does not change an already running coordinator's code. Run only one coordinator per run; it submits the GPU jobs itself.
 
+## Evaluate a completed run
+
+Run evaluation on the management node from `current/`:
+
+```sh
+nohup ~/.local/bin/uv run --no-sync python -u -m multi_llm.evaluate run \
+  --root /hpchome/hengyulee/sysdpo --run RUN_NAME \
+  --output /hpchome/hengyulee/sysdpo/evaluations/EVALUATION_NAME \
+  --gpus 2 --max-tokens 256 --workers 8 \
+  > /hpchome/hengyulee/sysdpo/evaluation.log 2>&1 < /dev/null &
+```
+
+Replace `RUN_NAME` with a completed training run and `EVALUATION_NAME` with an output
+directory name. `--gpus` requests 1, 2 or 4 GPUs on one node; `--max-tokens` caps new
+tokens per stage; `--workers` controls concurrent judge API calls. The coordinator
+submits GPU generation, waits for completion, then judges on the management node.
+
+Outputs include `evaluation.json`, `rows.json`, per-question records, `calls/`,
+`trained.json`, `prompted.json`, `chosen.json`, and `summary.json`. Completion is
+marked by `evaluation.ready`. Rerunning the same command reuses saved generations
+and successful judgments. Changed inputs or settings require a new output directory;
+failed or interrupted API calls remain saved for inspection.
+
 ## Source layout and checks
 
 | Directory | Responsibility |

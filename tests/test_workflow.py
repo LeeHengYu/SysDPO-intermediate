@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 import uuid
 
+import torch
+
 from multi_llm.judge import judge_collection
 from multi_llm.collect import collect
 from multi_llm.pipeline import pipeline, run_job
@@ -111,7 +113,8 @@ class WorkflowTests(unittest.TestCase):
                     raise RuntimeError("worker failed")
 
             select.assert_called_once_with(1)
-            initialize.assert_called_once_with(backend="nccl", timeout=timedelta(hours=30))
+            initialize.assert_called_once_with(backend="nccl", timeout=timedelta(hours=30),
+                                               device_id=torch.device("cuda", 1))
             close.assert_called_once_with()
 
     def test_slurm_worker_uses_its_single_visible_gpu(self):
@@ -119,10 +122,23 @@ class WorkflowTests(unittest.TestCase):
                                     "CUDA_VISIBLE_DEVICES": "7"}), \
                 patch("core.distributed.torch.cuda.device_count", return_value=1), \
                 patch("core.distributed.torch.cuda.set_device") as select, \
-                patch("core.distributed.dist.init_process_group"), \
+                patch("core.distributed.dist.init_process_group") as initialize, \
                 patch("core.distributed.dist.destroy_process_group"):
             with distributed_job():
                 select.assert_called_once_with(0)
+                initialize.assert_called_once_with(backend="nccl", timeout=timedelta(hours=30),
+                                                   device_id=torch.device("cuda", 0))
+
+    def test_cpu_process_group_does_not_select_cuda(self):
+        with patch.dict(os.environ, {"WORLD_SIZE": "2", "LOCAL_RANK": "1"}), \
+                patch("core.distributed.torch.cuda.set_device") as select, \
+                patch("core.distributed.dist.init_process_group") as initialize, \
+                patch("core.distributed.dist.destroy_process_group") as close:
+            with distributed_job("cpu"):
+                initialize.assert_called_once_with(backend="gloo", timeout=timedelta(hours=30),
+                                                   device_id=None)
+                select.assert_not_called()
+            close.assert_called_once_with()
 
     def test_submission_omits_api_key_and_reuses_completed_stage(self):
         root = Path(__file__).parent / ("submission_test_" + uuid.uuid4().hex)

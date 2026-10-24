@@ -8,7 +8,7 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError, ResponseValidationError
 
 
-def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1"):
+def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1", criteria=None):
     """Judge an intermediate pair independently of how A generated it.
 
     state contains candidate_1, candidate_2 and their task context.
@@ -16,7 +16,7 @@ def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1"):
     """
     questions = {"preference": {
         "type": "choice", "instructions": rubric,
-        "criteria": {
+        "criteria": criteria if criteria is not None else {
             "option1": "candidate_1 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
             "option2": "candidate_2 is preferable in correctness, completeness, adherence to the task's required output format, or downstream usefulness; at equal quality it is meaningfully more concise.",
         }}}
