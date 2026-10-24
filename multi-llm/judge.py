@@ -79,6 +79,7 @@ def judge_collection(collection, workers=8):
                 loser = second if decision.winner == first else first
                 record.preference_edges.append((decision.winner, loser))
             except Exception as error:
+                record.discard_reason = "judge error"
                 failures.append({"id": row_id, "pair": [first, second], "error": str(error)})
 
         for row in rows:

@@ -2,7 +2,9 @@
 
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+from subprocess import CompletedProcess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,11 +13,54 @@ import torch
 
 from core.workflow import PROMPT_FILE, save_json
 from multi_llm.evaluate import (FINAL_CRITERIA, final_comparison, generate,
-                                judge, prepare_evaluation)
+                                judge, prepare_evaluation, run)
 from tests.test_interfaces import decision
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_submission_queue_completion_and_resume(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            output = root / "evaluation"
+            commands = []
+
+            def submit(args, **kwargs):
+                commands.append(args)
+                if args[0] == "sbatch":
+                    self.assertIn("--nodes=1", args)
+                    self.assertIn("--ntasks=4", args)
+                    self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
+                    self.assertIsNone(json.loads((output / "generate_job.json").read_text())["job_id"])
+                    return CompletedProcess(args, 0, "123\n")
+                if len(commands) == 2:
+                    return CompletedProcess(args, 0, "PENDING|0:0\n")
+                (output / "generation.ready").touch()
+                return CompletedProcess(args, 0, "COMPLETED|0:0\n")
+
+            with patch("multi_llm.evaluate.prepare_evaluation", return_value=root / "checkpoint"), \
+                    patch("multi_llm.evaluate.subprocess.run", side_effect=submit), \
+                    patch("multi_llm.evaluate.time.sleep") as sleep, \
+                    patch("multi_llm.evaluate.judge") as judge, \
+                    patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}):
+                run(root, "source", output, gpus=4)
+                run(root, "source", output, gpus=4)
+            self.assertEqual(len(commands), 3)
+            sleep.assert_called_once_with(15)
+            self.assertEqual(judge.call_count, 2)
+
+            (output / "generation.ready").unlink()
+            for job, state in ((None, ""), ("123", "FAILED|1:0"), ("123", "COMPLETED|0:0")):
+                save_json(output / "generate_job.json", {"job_id": job})
+                with self.subTest(job=job, state=state), \
+                        patch("multi_llm.evaluate.prepare_evaluation", return_value=root / "checkpoint"), \
+                        patch("multi_llm.evaluate.subprocess.run",
+                              return_value=CompletedProcess([], 0, state)) as command, \
+                        patch("multi_llm.evaluate.judge") as judge:
+                    with self.assertRaises(RuntimeError):
+                        run(root, "source", output)
+                    judge.assert_not_called()
+                    self.assertTrue(all(call.args[0][0] == "sacct" for call in command.call_args_list))
+
     def test_split_generation_baseline_and_judgment_reuse(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary)
@@ -27,6 +72,7 @@ class EvaluationTests(unittest.TestCase):
             checkpoint = current / "checkpoints/rows_000001"
             checkpoint.mkdir(parents=True)
             (checkpoint / "complete").touch()
+            save_json(checkpoint / "state.json", {"optimizer_steps": 70, "data_hash": "tiny"})
             (current / "training.ready").touch()
             save_json(current / "collection_config.json", {
                 "base": {"revision": "tiny"}, "prompts": json.loads(PROMPT_FILE.read_text())})
@@ -82,6 +128,11 @@ class EvaluationTests(unittest.TestCase):
                     patch("multi_llm.evaluate.generate_answer", side_effect=predict):
                 generate(base, checkpoint, output, device="cpu")
                 generate(base, checkpoint, output, device="cpu")
+                state = json.loads((checkpoint / "state.json").read_text())
+                save_json(checkpoint / "state.json", {**state, "optimizer_steps": 20})
+                with self.assertRaisesRegex(ValueError, "Checkpoint differs"):
+                    generate(base, checkpoint, output, device="cpu")
+                save_json(checkpoint / "state.json", state)
             self.assertEqual([disabled for disabled, _ in seen], [False, False, True, True])
             self.assertIn("trained answer", seen[1][1][1]["content"])
             self.assertIn("base answer", seen[3][1][1]["content"])
@@ -95,6 +146,7 @@ class EvaluationTests(unittest.TestCase):
                 judge(output, workers=2)
             self.assertEqual(api.call_count, 3)
             self.assertEqual(api.call_args.kwargs["criteria"], FINAL_CRITERIA)
+            self.assertEqual(api.call_args.kwargs["model"], manifest["judge"])
             summary = json.loads((output / "summary.json").read_text())
             self.assertTrue(all(value["win_rate"] == 50 for value in summary["comparisons"].values()))
 
@@ -112,6 +164,15 @@ class EvaluationTests(unittest.TestCase):
             with patch("core.model_api.call_judge") as api:
                 self.assertEqual(final_comparison(directory, record, "trained_vs_prompted"), 0.5)
                 api.assert_not_called()
+
+    def test_zero_judge_workers_submit_no_gpu_work(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            with patch("multi_llm.evaluate.subprocess.run") as commands:
+                with self.assertRaisesRegex(ValueError, "Workers must be positive"):
+                    run(root, "source", root / "evaluation", workers=0)
+                commands.assert_not_called()
+            self.assertFalse((root / "evaluation").exists())
 
     def test_greedy_generation_uses_completion_only(self):
         from multi_llm.evaluate import generate_answer

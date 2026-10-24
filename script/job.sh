@@ -18,9 +18,6 @@ previous=${4:-}
 code=${5:?deployed source directory required}
 max_tokens=${6:-512}
 
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
-
 test "$SLURM_JOB_NUM_NODES" -eq 1
 
 # One launcher sees all allocated GPUs; torchrun assigns one GPU to each worker.

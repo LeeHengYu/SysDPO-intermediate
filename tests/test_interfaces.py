@@ -132,17 +132,54 @@ class InterfaceChecks(unittest.TestCase):
             (output / "calls").mkdir()
             messages = [{"role": "system", "content": "Compare quality"},
                         {"role": "user", "content": json.dumps({"candidate_1": "a", "candidate_2": "b"})}]
-            settings = {"temperature": 0, "max_tokens": 512, "json_output": True}
-            request = {"model": workflow.JUDGE, "messages": messages, **settings}
+            request = {"model": workflow.JUDGE, "messages": messages}
             expected_hash = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
             for _ in range(2):
-                result = workflow.recorded_call(output, 0, "judge_y1_y2", workflow.JUDGE, messages, **settings)
+                result = workflow.recorded_call(output, 0, "judge_y1_y2", workflow.JUDGE, messages)
                 self.assertEqual(json.loads(result), {"choice": "option1"})
 
             saved = json.loads((output / "calls/0_judge_y1_y2.json").read_text())
             self.assertEqual(saved["response"], raw)
             self.assertEqual(saved["request_sha256"], expected_hash)
             self.assertEqual(handler.call_count, 1)
+            saved["request"].update(temperature=0, max_tokens=512, json_output=True)
+            workflow.save_json(output / "calls/0_judge_y1_y2.json", saved)
+            workflow.recorded_call(output, 0, "judge_y1_y2", workflow.JUDGE, messages)
+            self.assertEqual(handler.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "Cached request changed"):
+                workflow.recorded_call(output, 0, "judge_y1_y2", workflow.JUDGE,
+                    [{"role": "system", "content": "Changed rubric"}, messages[1]])
+            self.assertEqual(handler.call_count, 1)
+
+    def test_invalid_judge_response_is_saved_as_failure_and_not_retried(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = Path(temporary)
+            (output / "calls").mkdir()
+            messages = [{"role": "system", "content": "Compare"},
+                        {"role": "user", "content": "{}"}]
+            with patch("core.workflow.call_judge", return_value=decision("tie")) as call:
+                with self.assertRaises(ValueError):
+                    workflow.recorded_call(output, 0, "judge", workflow.JUDGE, messages)
+                saved = json.loads((output / "calls/0_judge.json").read_text())
+                self.assertIn("error", saved)
+                self.assertIn("response", saved)
+                with self.assertRaisesRegex(RuntimeError, "Previous call failed"):
+                    workflow.recorded_call(output, 0, "judge", workflow.JUDGE, messages)
+                self.assertEqual(call.call_count, 1)
+
+    def test_intermediate_judge_receives_guidance_role_and_rubric(self):
+        prompts = workflow.load_prompts(workflow.PROMPT_FILE)
+        row = DatasetRow(id=0, question="q", chosen="c", rejected="r")
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = Path(temporary)
+            (output / "calls").mkdir()
+            with patch("core.workflow.call_judge", return_value=decision()) as call:
+                workflow.judge_pair(output, row, "guide one", "guide two", "pair", "y1", "y2", prompts)
+            task, rubric = call.call_args.args
+            self.assertEqual(task["response_role"], prompts.a_instruction)
+            self.assertEqual(rubric, prompts.judge_rubric)
+            self.assertNotIn("chosen", task)
+            self.assertNotIn("rejected", task)
 
     def test_decision_api_interface(self):
         raw = {"model": "microsoft/microsoft-decision-1", "provider": "Azure",

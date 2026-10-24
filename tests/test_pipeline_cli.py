@@ -170,6 +170,12 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(child["previous"], str(terminal))
         self.assertEqual(self.jobs, [])
 
+    def test_zero_judge_workers_submit_no_gpu_work(self):
+        with self.assertRaisesRegex(ValueError, "workers must be positive"):
+            pipeline(self.root, "invalid_workers", "all", 0)
+        self.assertEqual(self.jobs, [])
+        self.assertFalse((self.root / "runs/invalid_workers").exists())
+
     def test_fixed_rounds_do_not_refill_or_overlap(self):
         config = TrainingConfig(optimizer_rows=4, max_steps=2)
         events = []

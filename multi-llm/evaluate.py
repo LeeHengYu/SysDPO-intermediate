@@ -3,7 +3,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import asdict
 import hashlib
 import json
 import os
@@ -65,6 +64,7 @@ def prepare_evaluation(root, run, output, max_tokens):
 
     config = json.loads((rounds[-1] / "collection_config.json").read_text())
     manifest = {"run": run, "checkpoint": str(checkpoint), "max_tokens": max_tokens,
+                "checkpoint_state": json.loads((checkpoint / "state.json").read_text()),
                 "decoding": "greedy", "prompts": config["prompts"],
                 "base": config["base"], "row_ids": test_ids, "training_prompt_overlap_ids": overlap,
                 "test_sha256": hashlib.sha256(json.dumps(test, sort_keys=True).encode()).hexdigest(),
@@ -110,6 +110,8 @@ def generate(base, checkpoint, directory, device="cuda"):
         raise ValueError("Base model differs from training")
     if not (checkpoint / "complete").exists():
         raise ValueError("Checkpoint is incomplete")
+    if json.loads((checkpoint / "state.json").read_text()) != config["checkpoint_state"]:
+        raise ValueError("Checkpoint differs from evaluation manifest")
     rows = json.loads((directory / "rows.json").read_text())
     if hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest() != config["test_sha256"]:
         raise ValueError("Test data differs from manifest")
@@ -192,7 +194,7 @@ def final_comparison(directory, record, name):
 
     save_json(path, {**saved, "error": "Request started; response not yet saved"})
     try:
-        response = call_judge(task, FINAL_RUBRIC, criteria=FINAL_CRITERIA)
+        response = call_judge(task, FINAL_RUBRIC, model=JUDGE, criteria=FINAL_CRITERIA)
         saved["response"] = response
         answer = response["answers"]["preference"]
         choice = answer["choice"]

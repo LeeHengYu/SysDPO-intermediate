@@ -23,7 +23,7 @@ rsync -a "$root/models/Qwen1.5-1.8B-Chat/" "$scratch/base/"
 for name in A_adapter B_adapter; do
     rsync -a "$checkpoint/$name" "$scratch/checkpoint/"
 done
-cp "$checkpoint/complete" "$scratch/checkpoint/complete"
+cp "$checkpoint/complete" "$checkpoint/state.json" "$scratch/checkpoint/"
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4

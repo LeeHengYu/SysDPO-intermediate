@@ -1,5 +1,6 @@
 """Offline checks for concurrent judging and durable stage handoff."""
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from contextlib import contextmanager
 from datetime import timedelta
 from itertools import permutations, product
@@ -19,7 +20,8 @@ import torch
 from multi_llm.judge import judge_collection
 from multi_llm.collect import collect
 from multi_llm.pipeline import pipeline, run_job
-from core.training import TrainingConfig
+from multi_llm.runs import prepare_training
+from core.training import TrainingConfig, read_training_rows
 from core.schemas import DatasetRow, Judgment, QuestionRecord
 from core.distributed import distributed_job
 from core.topo_sort import topological_sort
@@ -84,7 +86,7 @@ class WorkflowTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "different configuration"):
                             pipeline(root, f"rounds{size}", len(rows), 8, TrainingConfig(), size + 1)
 
-            with self.assertRaisesRegex(ValueError, "Round size must be positive"):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
                 pipeline(root, "invalid", len(rows), 8, TrainingConfig(), 0)
         finally:
             shutil.rmtree(root)
@@ -152,6 +154,11 @@ class WorkflowTests(unittest.TestCase):
                     patch("multi_llm.collect.PeftModel.from_pretrained", return_value=model):
                 collect(root / "base", root / "rows.json", root / "output", root / "publish",
                         checkpoint=root / "checkpoint", device="cpu")
+                collect(root / "base", root / "rows.json", root / "output", root / "publish",
+                        checkpoint=root / "checkpoint", device="cpu")
+                with self.assertRaisesRegex(ValueError, "configuration changed"):
+                    collect(root / "base", root / "rows.json", root / "output", root / "publish",
+                            checkpoint=root / "checkpoint", device="cpu", max_tokens=1024)
             record = json.loads((root / "publish/question_0.json").read_text())
             self.assertEqual([record["y1"], record["y2"], record["y3"]], ["10", "11", "12"])
             self.assertEqual(record["reference_intermediates"], ["20", "21"])
@@ -230,6 +237,26 @@ class WorkflowTests(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
+    def test_failed_or_unreconciled_job_is_not_resubmitted(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            for job_id, state in ((None, None), ("123", "FAILED|1:0"), ("123", "COMPLETED|0:0")):
+                save_json(root / "train_job.json", {"job_id": job_id})
+                result = CompletedProcess([], 0, state, "")
+                with self.subTest(job_id=job_id, state=state), \
+                        patch("multi_llm.pipeline.subprocess.run", return_value=result) as commands:
+                    with self.assertRaises(RuntimeError):
+                        run_job("train", root, root)
+                    self.assertTrue(all(call.args[0][0] == "sacct" for call in commands.call_args_list))
+                self.assertFalse((root / "training.ready").exists())
+            (root / "train_job.json").unlink()
+            with patch.dict(os.environ, {"SBATCH_NODES": "2"}), \
+                    patch("multi_llm.pipeline.subprocess.run") as commands:
+                with self.assertRaisesRegex(ValueError, "one node"):
+                    run_job("train", root, root)
+                commands.assert_not_called()
+                self.assertFalse((root / "train_job.json").exists())
+
     def test_parallel_pairs_cycles_and_duplicate_prefilter(self):
         root = Path(__file__).parent / ("judge_test_" + uuid.uuid4().hex)
         root.mkdir()
@@ -275,6 +302,19 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([(p["y_chosen"], p["y_rejected"]) for p in preferences],
                              [("one", "two"), ("one", "three"), ("two", "three")])
             self.assertTrue((root / "preferences.ready").exists())
+            prepare_training(root, TrainingConfig())
+            selected, pairs, _ = read_training_rows(root / "training")
+            self.assertEqual([row.id for row in selected], [0, 1, 2])
+            self.assertEqual([len(pairs[row.id]) for row in selected], [3, 0, 0])
+            (root / "preferences.ready").unlink()
+            with patch("multi_llm.judge.judge_pair", side_effect=RuntimeError("API failed")) as judge:
+                with self.assertRaisesRegex(RuntimeError, "6 judge calls failed"):
+                    judge_collection(root, workers=3)
+            self.assertEqual(judge.call_count, 6)
+            self.assertFalse((root / "preferences.ready").exists())
+            self.assertEqual(json.loads((root / "judged_0.json").read_text())["discard_reason"], "judge error")
+            self.assertEqual(len(json.loads((root / "scoring_requests.json").read_text())), 3)
+            self.assertEqual(json.loads((root / "intermediate_preferences.json").read_text()), [])
         finally:
             shutil.rmtree(root)
 

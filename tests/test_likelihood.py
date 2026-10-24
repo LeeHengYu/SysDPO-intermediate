@@ -9,8 +9,27 @@ from torch import nn
 
 
 from core.likelihood import LAMBDA_A, completion_logp, dpo_pair_loss, get_probs, preference_losses, score_request
-from core.workflow import accumulate_gradients, freeze
 from core.schemas import ScoringRequest
+
+
+def freeze(model):
+    return deepcopy(model).eval().requires_grad_(False)
+
+
+def accumulate_gradients(loss_fn, batch, microbatch):
+    """Sum microbatch losses / full batch count, including a short last chunk."""
+    size = len(batch[0])
+    if size == 0 or microbatch < 1 or any(len(column) != size for column in batch):
+        raise ValueError("Need a nonempty aligned batch and positive microbatch size.")
+
+    total = 0.0
+    for start in range(0, size, microbatch):
+        chunk = tuple(column[start:start + microbatch] for column in batch)
+        contribution = loss_fn(chunk).sum() / size
+        contribution.backward()
+        total += contribution.detach().item()
+
+    return total
 
 
 QUESTIONS, MESSAGES, ANSWERS = 8, 4, 3

@@ -26,6 +26,8 @@ def run_job(stage, root, directory, previous=None, max_tokens=512):
         if job_id is None:
             raise RuntimeError("Submission was interrupted; reconcile Slurm jobs before resubmitting")
     else:
+        if os.environ.get("SBATCH_NODES", "1") != "1":
+            raise ValueError("GPU jobs require one node")
         script = Path(__file__).resolve().parent.parent / "script" / "job.sh"
         save_json(job_file, {"job_id": None, "stage": stage, "code": str(script.parent.parent)})
         result = subprocess.run(["sbatch", "--parsable",
@@ -67,8 +69,8 @@ def pipeline(root, run, questions, workers, config=None, round_size=128,
     from core.workflow import save_json
 
     root = root.resolve()
-    if round_size < 1 or max_tokens < 1:
-        raise ValueError("Round size must be positive; max tokens must be positive")
+    if round_size < 1 or max_tokens < 1 or workers < 1:
+        raise ValueError("Round size, max tokens and workers must be positive")
     if from_run == run:
         raise ValueError("Use a new run name when continuing from another run")
 

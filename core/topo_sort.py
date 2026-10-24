@@ -1,26 +1,13 @@
+from graphlib import CycleError, TopologicalSorter
+
+
 def topological_sort(edges) -> bool:
-    g = {}
-    for u, v in edges:
-        if u not in g:
-            g[u] = [v]
-        else:
-            g[u].append(v) 
+    graph = TopologicalSorter()
+    for winner, loser in edges:
+        graph.add(loser, winner)
 
-    visited = set()
-    cycle = set()
-
-    def dfs(node):
-        if node in visited:
-            return True
-        if node in cycle: 
-            return False
-
-        cycle.add(node)
-        for nei in g.get(node, []):
-            if not dfs(nei):
-                return False 
-        cycle.remove(node)
-        visited.add(node)
-        return True
-
-    return all(dfs(node) for node in g)
+    try:
+        graph.prepare()
+    except CycleError:
+        return False
+    return True

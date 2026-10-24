@@ -10,20 +10,16 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
-    def test_stage_each_node_launch_allocated_workers_and_publish_only_on_success(self):
+    def test_launch_allocated_workers_and_publish_only_on_success(self):
         script = Path(__file__).resolve().parents[1] / "script/job.sh"
         with TemporaryDirectory(prefix="launcher_", dir=Path(__file__).parent) as temporary:
             root = Path(temporary).resolve()
             commands = root / "bin"
             commands.mkdir()
-            control = commands / "scontrol"
-            control.write_text("#!/usr/bin/env bash\nprintf 'node2\\nnode3\\n'\n")
-            control.chmod(0o755)
             runner = commands / "srun"
             runner.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 with open(os.environ["LAUNCH_LOG"], "a") as stream:
-    stream.write(json.dumps({"args": sys.argv[1:], "master": os.environ["MASTER_ADDR"],
-                             "port": os.environ["MASTER_PORT"]}) + "\\n")
+    stream.write(json.dumps({"args": sys.argv[1:]}) + "\\n")
 if os.environ["FAIL_WORKER"] == "1" and "prepare" not in sys.argv:
     sys.exit(1)
 ''')
@@ -52,9 +48,14 @@ if os.environ["FAIL_WORKER"] == "1" and "prepare" not in sys.argv:
                     self.assertEqual(calls[1]["args"][-1], str(tasks))
                     self.assertIn("--gpu-bind=none", calls[1]["args"])
                     self.assertIn("--kill-on-bad-exit=1", calls[1]["args"])
-                    self.assertTrue(all(call["master"] == "node2" and call["port"] == "28695"
-                                        for call in calls))
                     self.assertEqual((collection / "training.ready").exists(), not fail)
+            env["SLURM_JOB_NUM_NODES"] = "2"
+            rejected = root / "rejected"
+            rejected.mkdir()
+            result = subprocess.run(["bash", str(script), "train", str(root), str(rejected),
+                                     "previous", str(root), "512"], env=env, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((rejected / "training.ready").exists())
 
 
 if __name__ == "__main__":
