@@ -19,6 +19,7 @@ from core.training import TrainingConfig
 from core.workflow import save_json
 from multi_llm.pipeline import main, pipeline
 from multi_llm.status import read_round_status
+from multi_llm.runs import prepare_training
 
 
 class PipelineCliTests(unittest.TestCase):
@@ -137,7 +138,7 @@ class PipelineCliTests(unittest.TestCase):
         pipeline(self.root, "child", 2, 8, from_run="source")
         selected = json.loads((self.root / "runs/child/experiment.json").read_text())
         self.assertEqual(selected["start_offset"], 4)
-        pipeline(self.root, "source", 4, 8, self.config, max_tokens=1024)
+        pipeline(self.root, "source", 4, 8, self.config, round_size=1024, max_tokens=1024)
 
     def test_shuffle_is_stable_for_resume_and_continuation(self):
         pipeline(self.root, "shuffled", 4, 8, self.config, round_size=2)
@@ -168,6 +169,78 @@ class PipelineCliTests(unittest.TestCase):
         child = json.loads((self.root / "runs/after_cap/experiment.json").read_text())
         self.assertEqual(child["previous"], str(terminal))
         self.assertEqual(self.jobs, [])
+
+    def test_fixed_rounds_do_not_refill_or_overlap(self):
+        config = TrainingConfig(optimizer_rows=4, max_steps=2)
+        events = []
+
+        def judge(current, workers):
+            selected = json.loads((current / "rows.json").read_text())
+            usable = selected[1:] if current.name == "round_000" else [] if current.name == "round_001" else selected
+            save_json(current / "scoring_requests.json", usable)
+            save_json(current / "intermediate_preferences.json", [])
+            (current / "preferences.ready").touch()
+
+        def job(stage, root, current, previous, max_tokens):
+            marker = current / ("candidates.ready" if stage == "collect" else "training.ready")
+            if marker.exists():
+                return
+            prior = json.loads((previous / "state.json").read_text())["optimizer_steps"] if previous else 0
+            selected = json.loads((current / "rows.json").read_text())
+            if stage == "collect":
+                events.append((len(selected), prior))
+            else:
+                inputs = json.loads((current / "training/scoring_requests.json").read_text())
+                self.assertLessEqual(len(inputs), config.optimizer_rows)
+                done = len(inputs)
+                checkpoint = current / f"checkpoints/rows_{done:06d}"
+                checkpoint.mkdir(parents=True)
+                save_json(checkpoint / "state.json", {
+                    "rows_done": done, "total_rows": len(inputs),
+                    "optimizer_steps": prior + bool(done),
+                    "config": asdict(config),
+                    "stop_reason": "collection_complete"})
+                (checkpoint / "complete").touch()
+            marker.touch()
+
+        with patch("multi_llm.pipeline.run_job", side_effect=job), \
+                patch("multi_llm.pipeline.prepare_training", side_effect=prepare_training), \
+                patch("multi_llm.judge.judge_collection", side_effect=judge):
+            pipeline(self.root, "aligned", "all", 8, config, round_size=4)
+            self.assertEqual(events, [(4, 0), (4, 1), (4, 1)])
+            pipeline(self.root, "aligned", "all", 8, config, round_size=4)
+            self.assertEqual(events, [(4, 0), (4, 1), (4, 1)])
+        directory = self.root / "runs/aligned"
+        self.assertEqual(len(list(directory.glob("round_*"))), 3)
+        collected = [json.loads((directory / f"round_{i:03d}/rows.json").read_text()) for i in range(3)]
+        ids = [row["id"] for group in collected for row in group]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), {row["id"] for row in self.rows})
+        self.assertEqual(json.loads((directory / "round_001/training/scoring_requests.json").read_text()), [])
+        third = json.loads((directory / "round_002/training/scoring_requests.json").read_text())
+        self.assertEqual(third, collected[2])
+
+    def test_training_row_sample_is_saved_with_only_its_preferences(self):
+        current = self.root / "round_000"
+        current.mkdir()
+        requests = [{"id": i} for i in range(128)]
+        preferences = [{"id": i, "pair": j} for i in range(128) for j in range(3)]
+        save_json(current / "scoring_requests.json", requests)
+        save_json(current / "intermediate_preferences.json", preferences)
+        config = TrainingConfig()
+        prepare_training(current, config)
+        expected = random.Random(f"{config.seed}:{current.name}").sample(requests, 64)
+        selected = json.loads((current / "training/scoring_requests.json").read_text())
+        self.assertEqual(selected, expected)
+        pairs = json.loads((current / "training/intermediate_preferences.json").read_text())
+        self.assertEqual(len(pairs), 192)
+        self.assertEqual({pair["id"] for pair in pairs}, {row["id"] for row in selected})
+        selection = json.loads((current / "training/selection.json").read_text())
+        self.assertEqual(selection["usable_rows"], 128)
+        self.assertEqual(selection["selected_row_ids"], [row["id"] for row in selected])
+        (current / "training/inputs.ready").unlink()
+        prepare_training(current, config)
+        self.assertEqual(json.loads((current / "training/scoring_requests.json").read_text()), selected)
 
     def test_invalid_selections_and_changed_configuration_submit_nothing(self):
         self.source_run()
@@ -207,6 +280,8 @@ class PipelineCliTests(unittest.TestCase):
         state["last_audit"] = {"L_sys": 0.6, "L_A": 0.4, "L_A_weighted": 0.2}
         save_json(checkpoint / "state.json", state)
         current = checkpoint.parent.parent
+        (current / "training").mkdir()
+        save_json(current / "training/selection.json", {"usable_rows": 4, "selected_row_ids": [12, 13]})
         (current.parent / "round_001").mkdir()
         for stage, job in (("collect", "100"), ("train", "101")):
             save_json(current / f"{stage}_job.json", {"job_id": job})
@@ -233,6 +308,7 @@ class PipelineCliTests(unittest.TestCase):
         self.assertIn("rows 3/4 | cumulative step 13", text)
         self.assertIn("Durably saved: 2/2 rows | cumulative step 12", text)
         self.assertIn("L_sys 0.600000 | L_A 0.400000 | weighted L_A 0.200000", text)
+        self.assertIn("Selected for update: 2/4 usable rows", text)
         self.assertIn("Cost is incomplete", text)
         self.assertIn("Preparing round metadata", text)
         self.assertEqual(query.call_args.args[0][0], "sacct")

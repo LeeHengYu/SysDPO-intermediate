@@ -82,42 +82,54 @@ def score_request(request: ScoringRequest, mid_model, output_model, ref_mid_mode
     """Score both final answers under every candidate context, plus A and refs."""
     request = ScoringRequest(**asdict(request))
 
-    def score_models(mid_model, output_model):
+    def score_models(mid_model, output_model, intermediates, contexts):
         log_mid_probs = torch.stack([
             completion_logp(mid_model, mid_tokenizer, request.a_messages, y, reduction)
-            for y in request.intermediates])
+            for y in intermediates])
         log_final_probs = torch.stack([torch.stack([
             completion_logp(output_model, output_tokenizer, messages, z, reduction)
             for z in request.final_answers
-        ]) for messages in request.b_messages])
+        ]) for messages in contexts])
         return log_mid_probs, log_final_probs
 
-    current_a, current_b = score_models(mid_model, output_model)
+    current_a, current_b = score_models(mid_model, output_model, request.intermediates, request.b_messages)
     with torch.no_grad():
-        reference_a, reference_b = score_models(ref_mid_model, ref_output_model)
-    return {"a": current_a, "b": current_b, "a_ref": reference_a, "b_ref": reference_b}
+        reference_a = torch.stack([
+            completion_logp(ref_mid_model, mid_tokenizer, request.a_messages, y, reduction)
+            for y in request.intermediates])
+        system_reference_a, reference_b = score_models(ref_mid_model, ref_output_model,
+            request.reference_intermediates, request.reference_b_messages)
+    return {"a": current_a, "b": current_b, "a_ref": reference_a,
+            "system_a_ref": system_reference_a, "b_ref": reference_b}
 
 
-def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0.5):
-    """A [N,K], B [N,K,2]; pairs: (row, chosen_index, rejected_index)."""
-    a, b, a_ref, b_ref = (scores[key] for key in ("a", "b", "a_ref", "b_ref"))
+def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0.5, reference_mask=None):
+    """Policy [N,K], reference [N,R]; auxiliary pairs index policy candidates."""
+    a, b, a_ref, system_a_ref, b_ref = (scores[key] for key in ("a", "b", "a_ref", "system_a_ref", "b_ref"))
     if a.ndim != 2:
         raise ValueError("Expected A score matrix [N,K]")
 
     n, k = a.shape
-    if n == 0 or k < 2 or a_ref.shape != a.shape or b.shape != (n, k, 2) or b_ref.shape != b.shape:
-        raise ValueError("Expected nonempty A [N,K] and B [N,K,2] score tensors")
-    if any(not torch.isfinite(t).all() or (t > 1e-6).any() for t in (a, b, a_ref, b_ref)):
+    if (n == 0 or k < 2 or a_ref.shape != a.shape or b.shape != (n, k, 2)
+            or system_a_ref.ndim != 2 or system_a_ref.shape[0] != n or system_a_ref.shape[1] < 2
+            or b_ref.shape != (*system_a_ref.shape, 2)):
+        raise ValueError("Expected policy [N,K] and reference [N,R] with matching B scores")
+    if any(not torch.isfinite(t).all() or (t > 1e-6).any() for t in (a, b, a_ref, system_a_ref, b_ref)):
         raise ValueError("Completion log scores must be finite and nonpositive")
 
     if candidate_mask is None:
         candidate_mask = torch.ones_like(a, dtype=torch.bool)
     if candidate_mask.shape != a.shape or candidate_mask.dtype != torch.bool or not candidate_mask.any(dim=1).all():
         raise ValueError("Each question needs a nonempty boolean candidate mask")
+    if reference_mask is None:
+        reference_mask = torch.ones_like(system_a_ref, dtype=torch.bool)
+    if (reference_mask.shape != system_a_ref.shape or reference_mask.dtype != torch.bool
+            or not reference_mask.any(dim=1).all()):
+        raise ValueError("Each question needs a nonempty boolean reference mask")
 
     policy = torch.logsumexp((a[:, :, None] + b).masked_fill(~candidate_mask[:, :, None], -torch.inf), dim=1)
-    reference = torch.logsumexp((a_ref.detach()[:, :, None] + b_ref.detach()).masked_fill(
-        ~candidate_mask[:, :, None], -torch.inf), dim=1)
+    reference = torch.logsumexp((system_a_ref.detach()[:, :, None] + b_ref.detach()).masked_fill(
+        ~reference_mask[:, :, None], -torch.inf), dim=1)
     system_rows = dpo_pair_loss(policy[:, 0], policy[:, 1], reference[:, 0], reference[:, 1], beta_sys)
 
     auxiliary = a.new_zeros(())
@@ -140,7 +152,4 @@ def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0
 
     system = system_rows.mean()
     return {"L_sys": system, "L_A": auxiliary, "L_A_weighted": LAMBDA_A * auxiliary,
-            "L_total": system + LAMBDA_A * auxiliary,
-            "final_reward_w": (policy[:, 0] - reference[:, 0]).mean(),
-            "final_reward_l": (policy[:, 1] - reference[:, 1]).mean(),
-            "N": n, "M": len(pairs)}
+            "L_total": system + LAMBDA_A * auxiliary}

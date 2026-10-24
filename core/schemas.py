@@ -61,6 +61,9 @@ class ScoringRequest:
     b_messages: Annotated[list[Messages], Field(min_length=2, max_length=3)]
     final_answers: Annotated[list[Text], Field(min_length=2, max_length=2)]
     candidate_mask: Annotated[list[StrictBool], Field(min_length=2, max_length=3)]
+    reference_intermediates: Annotated[list[Text], Field(min_length=2, max_length=2)]
+    reference_b_messages: Annotated[list[Messages], Field(min_length=2, max_length=2)]
+    reference_candidate_mask: Annotated[list[StrictBool], Field(min_length=2, max_length=2)]
     request_sha256: str = ""
 
     def __post_init__(self):
@@ -68,6 +71,8 @@ class ScoringRequest:
             raise ValueError("Candidates, B contexts and mask must have matching lengths")
         if not any(self.candidate_mask):
             raise ValueError("Each question needs a usable intermediate candidate")
+        if not any(self.reference_candidate_mask):
+            raise ValueError("Each question needs a usable reference candidate")
 
         payload = asdict(self)
         payload.pop("request_sha256")
@@ -91,6 +96,7 @@ class QuestionRecord:
     y1: str | None = None
     y2: str | None = None
     y3: str | None = None
+    reference_intermediates: list[str] | None = None
     intermediate_judgments: list[Judgment] = field(default_factory=list)
     preference_edges: list[tuple[str, str]] = field(default_factory=list)
     comparisons_accepted: bool = False

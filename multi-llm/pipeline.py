@@ -28,7 +28,9 @@ def run_job(stage, root, directory, previous=None, max_tokens=512):
     else:
         script = Path(__file__).resolve().parent.parent / "script" / "job.sh"
         save_json(job_file, {"job_id": None, "stage": stage, "code": str(script.parent.parent)})
-        result = subprocess.run(["sbatch", "--parsable", "--time",
+        result = subprocess.run(["sbatch", "--parsable",
+            "--ntasks", os.environ.get("SBATCH_NTASKS", "1"),
+            "--nodes", os.environ.get("SBATCH_NODES", "1"), "--time",
             "30:00:00" if stage == "collect" else "04:00:00", "--output", str(directory / f"{stage}_%j.log"),
             str(script), stage, str(root), str(directory), str(previous) if previous else "",
             str(script.parent.parent), str(max_tokens)],
@@ -58,7 +60,7 @@ def run_job(stage, root, directory, previous=None, max_tokens=512):
         time.sleep(15)
 
 
-def pipeline(root, run, questions, workers, config=None, round_size=1024,
+def pipeline(root, run, questions, workers, config=None, round_size=128,
              from_run=None, start_offset=None, max_tokens=512):
     from multi_llm.judge import judge_collection
     from core.training import TrainingConfig
@@ -128,7 +130,7 @@ def pipeline(root, run, questions, workers, config=None, round_size=1024,
             if not (current / "preferences.ready").exists():
                 judge_collection(current, workers)
 
-            prepare_training(current, previous)
+            prepare_training(current, config)
             run_job("train", root, current, previous, max_tokens)
             previous = latest_checkpoint(current)
             if previous is None:
@@ -142,8 +144,8 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", required=True)
     parser.add_argument("--questions", default="1024", help="Additional question count, or all remaining rows")
-    parser.add_argument("--round-size", type=int, default=1024,
-                        help="Question rows collected before each judging/training round")
+    parser.add_argument("--round-size", type=int, default=128,
+                        help="Fixed questions per collection round; no refill or carryover")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--from-run", help="Source run whose latest completed round supplies the checkpoint")

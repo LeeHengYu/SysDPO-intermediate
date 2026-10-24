@@ -17,30 +17,25 @@ def latest_checkpoint(directory):
     return completed[-1].parent if completed else None
 
 
-def prepare_training(directory, previous=None):
-    """Prepend unused scored rows without regenerating candidates or judging again."""
+def prepare_training(directory, config):
+    """Persist one reproducible row sample and all of its intermediate preferences."""
     from core.workflow import save_json
 
     target = directory / "training"
     if (target / "inputs.ready").exists():
         return
-    requests, preferences = [], []
-    if previous:
-        state = json.loads((previous / "state.json").read_text())
-        if state["rows_done"] < state["total_rows"]:
-            source = previous.parent.parent / "training"
-            if not source.exists():
-                source = previous.parent.parent
-            requests = json.loads((source / "scoring_requests.json").read_text())[state["rows_done"]:]
-            ids = {row["id"] for row in requests}
-            preferences = [pair for pair in json.loads((source / "intermediate_preferences.json").read_text())
-                           if pair["id"] in ids]
-
-    requests += json.loads((directory / "scoring_requests.json").read_text())
-    preferences += json.loads((directory / "intermediate_preferences.json").read_text())
+    requests = json.loads((directory / "scoring_requests.json").read_text())
+    usable_count = len(requests)
+    if usable_count > config.optimizer_rows:
+        requests = random.Random(f"{config.seed}:{directory.name}").sample(requests, config.optimizer_rows)
+    ids = {row["id"] for row in requests}
+    preferences = [pair for pair in json.loads((directory / "intermediate_preferences.json").read_text())
+                   if pair["id"] in ids]
     target.mkdir(exist_ok=True)
     save_json(target / "scoring_requests.json", requests)
     save_json(target / "intermediate_preferences.json", preferences)
+    save_json(target / "selection.json", {"usable_rows": usable_count,
+              "selected_row_ids": [row["id"] for row in requests], "seed": config.seed})
     (target / "inputs.ready").touch()
 
 
@@ -58,7 +53,7 @@ def continuation(root, run, dataset, checkpoint=None):
             if candidate and (current / "training.ready").exists():
                 state = json.loads((candidate / "state.json").read_text())
                 if (state["rows_done"] == state["total_rows"]
-                        or state.get("stop_reason") in ("max_steps", "collection_remainder")):
+                        or state.get("stop_reason") == "max_steps"):
                     checkpoint = candidate
                     break
         else:
@@ -70,7 +65,7 @@ def continuation(root, run, dataset, checkpoint=None):
     if (current.parent != directory or not (checkpoint / "complete").exists()
             or not (current / "training.ready").exists()
             or (state["rows_done"] != state["total_rows"]
-                and state.get("stop_reason") not in ("max_steps", "collection_remainder"))):
+                and state.get("stop_reason") != "max_steps")):
         raise ValueError("Source checkpoint is not a completed training round")
 
     consumed = [row["id"] for item in rounds if item <= current

@@ -58,6 +58,11 @@ def read_round_status(current, jobs, states, optimizer_rows):
         report.lines.append(f"Training data: {summary['system_rows']} system rows | {summary['accepted_pairs']} intermediate pairs")
         report.lines.append(f"Filtering: {dict(outcomes)} | judge errors: {len(summary['errors'])}")
 
+    selection_path = current / "training/selection.json"
+    if selection_path.exists():
+        selection = json.loads(selection_path.read_text())
+        report.lines.append(f"Selected for update: {len(selection['selected_row_ids'])}/{selection['usable_rows']} usable rows")
+
     training_job = jobs.get(current / "train_job.json")
     log = current / f"train_{training_job['job_id']}.log" if training_job else None
     if log and log.exists():

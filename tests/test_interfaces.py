@@ -12,7 +12,7 @@ import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from core import model_api, workflow
-from core.schemas import Judgment, Prompts, QuestionRecord, ScoringRequest
+from core.schemas import DatasetRow, Judgment, Prompts, QuestionRecord, ScoringRequest
 
 
 def decision(choice="option1"):
@@ -22,9 +22,21 @@ def decision(choice="option1"):
 
 
 class InterfaceChecks(unittest.TestCase):
+    def test_preferred_option_maps_back_to_the_candidate_id(self):
+        prompts = workflow.load_prompts(workflow.PROMPT_FILE)
+        row = DatasetRow(id=7, question="question", chosen="yes", rejected="no")
+        for choice, winner_index in (("option1", 0), ("option2", 1)):
+            with self.subTest(choice=choice), patch("core.workflow.recorded_call",
+                    return_value=json.dumps({"choice": choice})):
+                judged = workflow.judge_pair(Path("unused"), row, "one", "two",
+                                             "judge_y1_y2", "y1", "y2", prompts)
+            self.assertEqual(judged.winner, judged.presented_order[winner_index])
+
     def test_scoring_request_hash_and_shape_validation(self):
         original = {"id": 0, "a_messages": [], "intermediates": ["y1", "y2"],
-                    "b_messages": [[], []], "final_answers": ["c", "r"], "candidate_mask": [True, True]}
+                    "b_messages": [[], []], "final_answers": ["c", "r"], "candidate_mask": [True, True],
+                    "reference_intermediates": ["ref1", "ref2"], "reference_b_messages": [[], []],
+                    "reference_candidate_mask": [True, True]}
         request = ScoringRequest(**original)
         expected = hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest()
         self.assertEqual(request.request_sha256, expected)

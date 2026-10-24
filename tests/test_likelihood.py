@@ -223,17 +223,21 @@ class LikelihoodChecks(unittest.TestCase):
             intermediates=["y1", "y2"],
             b_messages=[[{"role": "user", "content": "y1"}],
                         [{"role": "user", "content": "y2"}]],
-            final_answers=["chosen", "rejected"], candidate_mask=[True, True])
+            final_answers=["chosen", "rejected"], candidate_mask=[True, True],
+            reference_intermediates=["y2", "y1"],
+            reference_b_messages=[[{"role": "user", "content": "y2"}],
+                                  [{"role": "user", "content": "y1"}]],
+            reference_candidate_mask=[True, True])
 
         scores = score_request(request, a, b, a_ref, b_ref, tokenizer, tokenizer)
 
         # This bigram model favors repeating the context token: y1 -> chosen,
         # y2 -> rejected. Reusing either context twice must fail these checks.
-        for key in ("b", "b_ref"):
-            self.assertGreater(scores[key][0, 0].item(), scores[key][1, 0].item())
-            self.assertLess(scores[key][0, 1].item(), scores[key][1, 1].item())
-            self.assertGreater(scores[key][0, 0].item(), scores[key][0, 1].item())
-            self.assertLess(scores[key][1, 0].item(), scores[key][1, 1].item())
+        for key, first, second in (("b", 0, 1), ("b_ref", 1, 0)):
+            self.assertGreater(scores[key][first, 0].item(), scores[key][second, 0].item())
+            self.assertLess(scores[key][first, 1].item(), scores[key][second, 1].item())
+            self.assertGreater(scores[key][first, 0].item(), scores[key][first, 1].item())
+            self.assertLess(scores[key][second, 0].item(), scores[key][second, 1].item())
 
     def test_get_probs_matches_source_values_and_gradients(self):
         torch.manual_seed(11)
@@ -271,7 +275,8 @@ class LikelihoodChecks(unittest.TestCase):
         policy = sum(source_a[:, k, None].exp() * source_b[:, k].exp() for k in range(2)).log()
         reference = sum(a_ref[:, k, None].exp() * b_ref[:, k].exp() for k in range(2)).log()
         expected = dpo_pair_loss(policy[:, 0], policy[:, 1], reference[:, 0], reference[:, 1]).mean()
-        actual = preference_losses({"a": a, "b": b, "a_ref": a_ref, "b_ref": b_ref}, [])["L_sys"]
+        actual = preference_losses({"a": a, "b": b, "a_ref": a_ref, "system_a_ref": a_ref,
+                                    "b_ref": b_ref}, [])["L_sys"]
         torch.testing.assert_close(actual, expected)
         actual.backward()
         expected.backward()
@@ -297,7 +302,8 @@ class LikelihoodChecks(unittest.TestCase):
         a_ref, b_ref = deepcopy(a).requires_grad_(False), deepcopy(b).requires_grad_(False)
         request = ScoringRequest(id=0, a_messages=[], intermediates=["y1", "y2"],
                                  b_messages=[[], []], final_answers=["chosen", "rejected"],
-                                 candidate_mask=[True, True])
+                                 candidate_mask=[True, True], reference_intermediates=["y2", "y1"],
+                                 reference_b_messages=[[], []], reference_candidate_mask=[True, True])
         scores = score_request(request, a, b, a_ref, b_ref, tokenizer, tokenizer)
         scores = {k: value[None] for k, value in scores.items()}
         losses = preference_losses(scores, [(0, 0, 1)])
@@ -317,6 +323,7 @@ class LikelihoodChecks(unittest.TestCase):
         a = torch.tensor([[-1., -2.], [-2., -1.]], requires_grad=True)
         b = torch.tensor([[[-1., -2.], [-3., -1.]], [[-2., -1.], [-1., -3.]]], requires_grad=True)
         scores = {"a": a, "b": b, "a_ref": a.detach().clone().requires_grad_(),
+                  "system_a_ref": a.detach().clone().requires_grad_(),
                   "b_ref": b.detach().clone().requires_grad_()}
         losses = preference_losses(scores, [(0, 0, 1), (1, 1, 0)])
         self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.5 * math.log(2), places=6)
@@ -330,7 +337,6 @@ class LikelihoodChecks(unittest.TestCase):
         self.assertGreater(a.grad.abs().sum(), 0)
         self.assertGreater(b.grad.abs().sum(), 0)
         empty = preference_losses(scores, [])
-        self.assertEqual(empty["M"], 0)
         self.assertEqual(empty["L_A"].item(), 0)
         self.assertEqual(empty["L_A_weighted"].item(), 0)
         with self.assertRaises(ValueError):
@@ -339,17 +345,43 @@ class LikelihoodChecks(unittest.TestCase):
     def test_three_pairs_share_one_question(self):
         a = torch.tensor([[-1., -2., -3.]], requires_grad=True)
         b = torch.tensor([[[-1., -2.], [-2., -1.], [-3., -1.]]], requires_grad=True)
-        scores = {"a": a, "b": b, "a_ref": a.detach().clone(), "b_ref": b.detach().clone()}
+        scores = {"a": a, "b": b, "a_ref": a.detach().clone(), "system_a_ref": a.detach().clone(),
+                  "b_ref": b.detach().clone()}
         pairs = [(0, 0, 1), (0, 0, 2), (0, 1, 2)]
         losses = preference_losses(scores, pairs)
-        self.assertEqual(losses["N"], 1)
-        self.assertEqual(losses["M"], 3)
         self.assertAlmostEqual(losses["L_A_weighted"].item(), 0.5 * math.log(2), places=6)
         losses["L_A_weighted"].backward()
         self.assertLess(a.grad[0, 0].item(), 0)
         self.assertAlmostEqual(a.grad[0, 1].item(), 0)
         self.assertGreater(a.grad[0, 2].item(), 0)
         self.assertIsNone(b.grad)
+
+    def test_reference_system_support_does_not_enter_auxiliary_loss(self):
+        a = torch.tensor([[-1., -2., -3.]], requires_grad=True)
+        b = torch.tensor([[[-1., -2.], [-3., -1.], [-2., -2.]]], requires_grad=True)
+        scores = {"a": a, "b": b, "a_ref": a.detach().clone(),
+                  "system_a_ref": torch.tensor([[-0.5, -1.5]], requires_grad=True),
+                  "b_ref": torch.tensor([[[-0.2, -3.], [-4., -0.1]]], requires_grad=True)}
+        policy_mask = torch.tensor([[True, True, False]])
+        reference_mask = torch.tensor([[False, True]])
+        losses = preference_losses(scores, [(0, 1, 0)], policy_mask, reference_mask=reference_mask)
+        policy = torch.logsumexp(a[0, :2, None] + b[0, :2], dim=0)
+        reference = scores["system_a_ref"][0, 1] + scores["b_ref"][0, 1]
+        expected = dpo_pair_loss(policy[0], policy[1], reference[0], reference[1])
+        torch.testing.assert_close(losses["L_sys"], expected)
+
+        changed = {**scores, "b_ref": scores["b_ref"].flip(-1)}
+        other = preference_losses(changed, [(0, 1, 0)], policy_mask, reference_mask=reference_mask)
+        self.assertNotAlmostEqual(losses["L_sys"].item(), other["L_sys"].item())
+        torch.testing.assert_close(losses["L_A"], other["L_A"])
+
+        losses["L_A"].backward(retain_graph=True)
+        self.assertLess(a.grad[0, 1].item(), 0)  # Preferred second candidate is chosen.
+        self.assertGreater(a.grad[0, 0].item(), 0)
+        self.assertIsNone(b.grad)
+        losses["L_sys"].backward()
+        self.assertIsNone(scores["system_a_ref"].grad)
+        self.assertIsNone(scores["b_ref"].grad)
 
 
 if __name__ == "__main__":

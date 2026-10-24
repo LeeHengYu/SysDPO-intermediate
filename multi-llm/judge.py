@@ -42,10 +42,20 @@ def judge_collection(collection, workers=8):
 
             ys = list(candidates.values())
             normalized = [y.strip() for y in ys]
+            ref_ys = record.reference_intermediates
+            if ref_ys is None:
+                raise ValueError("Missing frozen-reference candidates; recollect with the new format")
+            if any(not y.strip() for y in ref_ys):
+                record.discard_reason = "empty reference generation"
+                continue
+            ref_normalized = [y.strip() for y in ref_ys]
             request = ScoringRequest(id=row.id, a_messages=record.a_messages, intermediates=ys,
                 b_messages=[model_messages(row, prompts, prompts.b_instruction, y) for y in ys],
                 final_answers=[row.chosen, row.rejected],
-                candidate_mask=[y not in normalized[:i] for i, y in enumerate(normalized)])
+                candidate_mask=[y not in normalized[:i] for i, y in enumerate(normalized)],
+                reference_intermediates=ref_ys,
+                reference_b_messages=[model_messages(row, prompts, prompts.b_instruction, y) for y in ref_ys],
+                reference_candidate_mask=[y not in ref_normalized[:i] for i, y in enumerate(ref_normalized)])
             requests.append(request)
             record.scoring_request = request
 

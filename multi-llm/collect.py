@@ -1,6 +1,7 @@
-"""Generate a frozen A snapshot's three DBS candidates without network access."""
+"""Generate policy and frozen-reference DBS candidates without network access."""
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -36,6 +37,8 @@ def collect(base, data, output, publish, offset=0, count=None, checkpoint=None,
     config = {"base": identity, "snapshot": snapshot, "prompts": asdict(prompts),
               "rows": [asdict(row) for row in rows], "max_tokens": max_tokens,
               "num_beams": 3, "num_beam_groups": 3, "diversity_penalty": 10.0}
+    config["reference_generation"] = {"num_beams": 2, "num_beam_groups": 2,
+                                      "max_tokens": max_tokens, "diversity_penalty": 10.0}
 
     output.mkdir(parents=True, exist_ok=True)
     publish.mkdir(parents=True, exist_ok=True)
@@ -71,24 +74,32 @@ def collect(base, data, output, publish, offset=0, count=None, checkpoint=None,
         tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                return_tensors="pt").to(device)
 
-        with torch.inference_mode():
-            sequences = model.generate(input_ids=tokens, attention_mask=torch.ones_like(tokens),
-                num_beams=3, num_beam_groups=3, num_return_sequences=3, diversity_penalty=10.0,
-                do_sample=False, temperature=1.0, top_p=1.0, max_new_tokens=max_tokens,
-                pad_token_id=tokenizer.eos_token_id)
-
         record = QuestionRecord(id=row.id, x=row.question, system=row.system,
-            z_chosen=row.chosen, z_rejected=row.rejected, a_messages=messages)
+            z_chosen=row.chosen, z_rejected=row.rejected, a_messages=messages,
+            reference_intermediates=[])
 
         counts = {}
-        for name_y, sequence in zip(("y1", "y2", "y3"), sequences):
-            completion = sequence[tokens.shape[1]:].tolist()
-            finished = tokenizer.eos_token_id in completion
-            if finished:
-                completion = completion[:completion.index(tokenizer.eos_token_id) + 1]
-            setattr(record, name_y, tokenizer.decode(completion, skip_special_tokens=True))
-            record.finish_reasons[name_y] = "stop" if finished else "length"
-            counts[name_y] = len(completion)
+        for reference, beams in ((False, 3), (True, 2)):
+            adapter_context = model.disable_adapter() if reference and checkpoint else nullcontext()
+            with adapter_context, torch.inference_mode():
+                sequences = model.generate(input_ids=tokens, attention_mask=torch.ones_like(tokens),
+                    num_beams=beams, num_beam_groups=beams, num_return_sequences=beams, diversity_penalty=10.0,
+                    do_sample=False, temperature=1.0, top_p=1.0, max_new_tokens=max_tokens,
+                    pad_token_id=tokenizer.eos_token_id)
+
+            for index, sequence in enumerate(sequences, 1):
+                completion = sequence[tokens.shape[1]:].tolist()
+                finished = tokenizer.eos_token_id in completion
+                if finished:
+                    completion = completion[:completion.index(tokenizer.eos_token_id) + 1]
+                text = tokenizer.decode(completion, skip_special_tokens=True)
+                finish = "stop" if finished else "length"
+                if reference:
+                    record.reference_intermediates.append(text)
+                else:
+                    setattr(record, f"y{index}", text)
+                    record.finish_reasons[f"y{index}"] = finish
+                counts[f"reference_y{index}" if reference else f"y{index}"] = len(completion)
 
         save_json(output / name, record)
         save_json(output / f"tokens_{row.id}.json", {"prompt_tokens": tokens.shape[1], "completion_tokens": counts})

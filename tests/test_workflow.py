@@ -1,5 +1,6 @@
 """Offline checks for concurrent judging and durable stage handoff."""
 from pathlib import Path
+from contextlib import contextmanager
 from datetime import timedelta
 from itertools import permutations, product
 import json
@@ -108,6 +109,57 @@ class WorkflowTests(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
+    def test_collection_generates_reference_with_adapter_disabled(self):
+        root = Path(__file__).parent / ("reference_test_" + uuid.uuid4().hex)
+        (root / "base").mkdir(parents=True)
+        (root / "checkpoint").mkdir()
+        identity = {"model_id": "test"}
+        save_json(root / "base/provenance.json", identity)
+        save_json(root / "checkpoint/state.json", {"base_identity": identity})
+        (root / "checkpoint/complete").touch()
+        save_json(root / "rows.json", [DatasetRow(id=0, question="q", chosen="yes", rejected="no")])
+        calls = []
+
+        class Tokenizer:
+            eos_token_id = 0
+
+            def apply_chat_template(self, messages, **kwargs):
+                return torch.tensor([[1, 2]])
+
+            def decode(self, tokens, **kwargs):
+                return str(tokens[0])
+
+        class Model(torch.nn.Module):
+            disabled = False
+
+            @contextmanager
+            def disable_adapter(self):
+                self.disabled = True
+                try:
+                    yield
+                finally:
+                    self.disabled = False
+
+            def generate(self, input_ids, **kwargs):
+                calls.append((self.disabled, kwargs["num_beams"], kwargs["max_new_tokens"]))
+                return torch.tensor([[1, 2, (20 if self.disabled else 10) + i, 0]
+                                     for i in range(kwargs["num_return_sequences"])])
+
+        model = Model()
+        try:
+            with patch("multi_llm.collect.AutoTokenizer.from_pretrained", return_value=Tokenizer()), \
+                    patch("multi_llm.collect.AutoModelForCausalLM.from_pretrained", return_value=model), \
+                    patch("multi_llm.collect.PeftModel.from_pretrained", return_value=model):
+                collect(root / "base", root / "rows.json", root / "output", root / "publish",
+                        checkpoint=root / "checkpoint", device="cpu")
+            record = json.loads((root / "publish/question_0.json").read_text())
+            self.assertEqual([record["y1"], record["y2"], record["y3"]], ["10", "11", "12"])
+            self.assertEqual(record["reference_intermediates"], ["20", "21"])
+            self.assertEqual(calls, [(False, 3, 512), (True, 2, 512)])
+            self.assertFalse(model.disabled)
+        finally:
+            shutil.rmtree(root)
+
     def test_distributed_job_allows_long_shards_and_closes_on_failure(self):
         with patch.dict(os.environ, {"WORLD_SIZE": "2", "LOCAL_RANK": "1"}), \
                 patch("core.distributed.torch.cuda.device_count", return_value=2), \
@@ -158,6 +210,8 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(args[-2], str(script.parent.parent))
                     self.assertEqual(args[-1], "512")
                     self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
+                    self.assertEqual(args[args.index("--ntasks") + 1], "4")
+                    self.assertEqual(args[args.index("--nodes") + 1], "1")
                     self.assertIsNone(json.loads((root / f"{stage}_job.json").read_text())["job_id"])
                     self.assertEqual(args[args.index("--time") + 1],
                                      "30:00:00" if stage == "collect" else "04:00:00")
@@ -165,7 +219,8 @@ class WorkflowTests(unittest.TestCase):
                 (root / ("training.ready" if stage == "train" else "candidates.ready")).touch()
                 return CompletedProcess(args, 0, "COMPLETED|0:0|\n", "")
 
-            with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}), \
+            with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only",
+                                         "SBATCH_NTASKS": "4", "SBATCH_NODES": "1"}), \
                     patch("multi_llm.pipeline.subprocess.run", side_effect=command) as submitted:
                 for stage in ("train", "collect"):
                     run_job(stage, root, root, max_tokens=512)
@@ -189,6 +244,7 @@ class WorkflowTests(unittest.TestCase):
                 record = QuestionRecord(id=row.id, x=row.question, system="", z_chosen="yes", z_rejected="no",
                     a_messages=model_messages(row, prompts, prompts.a_instruction),
                     y1="one", y2="two", y3="three" if row.id < 2 else " one ",
+                    reference_intermediates=["reference one", "reference two"],
                     finish_reasons={"y1": "stop", "y2": "stop", "y3": "stop"})
                 save_json(root / f"question_{row.id}.json", record)
             (root / "candidates.ready").touch()
@@ -215,6 +271,9 @@ class WorkflowTests(unittest.TestCase):
             requests = json.loads((root / "scoring_requests.json").read_text())
             self.assertEqual(len(requests), 3)
             self.assertEqual(requests[2]["candidate_mask"], [True, True, False])
+            self.assertEqual(requests[0]["reference_intermediates"], ["reference one", "reference two"])
+            self.assertEqual([(p["y_chosen"], p["y_rejected"]) for p in preferences],
+                             [("one", "two"), ("one", "three"), ("two", "three")])
             self.assertTrue((root / "preferences.ready").exists())
         finally:
             shutil.rmtree(root)

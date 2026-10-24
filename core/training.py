@@ -1,6 +1,5 @@
 """Offline LoRA updates for saved SysDPO requests; no network calls."""
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
 import json
@@ -23,7 +22,6 @@ from core.workflow import save_json
 class TrainingConfig:
     max_steps: int = 70
     optimizer_rows: int = 64
-    checkpoint_rows: int = 256
     learning_rate: float = 6.4e-6
     warmup_steps: int = 20
     beta: float = 0.5
@@ -36,7 +34,7 @@ class TrainingConfig:
     def __post_init__(self):
         if self.max_steps < 1:
             raise ValueError("Optimizer step budget must be positive")
-        if self.optimizer_rows < 1 or self.checkpoint_rows < 1:
+        if self.optimizer_rows < 1:
             raise ValueError("Row counts must be positive")
         if self.learning_rate <= 0 or self.warmup_steps < 0:
             raise ValueError("Invalid learning rate or warmup")
@@ -124,7 +122,8 @@ def backward_row(request, pairs, models, tokenizer, system_count, pair_count, co
     leaves["a"].requires_grad_()
     leaves["b"].requires_grad_()
     mask = torch.tensor([request.candidate_mask], device=leaves["a"].device)
-    losses = preference_losses(leaves, pairs, mask, config.beta, config.beta)
+    reference_mask = torch.tensor([request.reference_candidate_mask], device=leaves["a"].device)
+    losses = preference_losses(leaves, pairs, mask, config.beta, config.beta, reference_mask)
     loss = losses["L_sys"] / system_count
     if pair_count:
         loss = loss + losses["L_A_weighted"] * len(pairs) / pair_count
@@ -194,9 +193,11 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
     if resume and previous:
         raise ValueError("Use resume for this collection or previous for a new collection")
     requests, pairs, data_hash = read_training_rows(collection)
+    if len(requests) > config.optimizer_rows:
+        raise ValueError("Prepare at most optimizer_rows selected rows for one collection update")
     base_identity = json.loads((base / "provenance.json").read_text())
     checkpoint = resume or previous
-    start, step = 0, 0
+    step = 0
     if checkpoint:
         if not (checkpoint / "complete").exists():
             raise ValueError("Checkpoint has not completed synchronization")
@@ -210,18 +211,14 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
                 raise ValueError("Resume must use the checkpoint's GPU/process count")
             if saved["data_hash"] != data_hash:
                 raise ValueError("Resume data differs from checkpoint")
-            start = saved["rows_done"]
-        elif (saved["rows_done"] != saved["total_rows"]
-              and saved.get("stop_reason") != "collection_remainder"):
-            raise ValueError("Previous collection is incomplete")
+        if saved["rows_done"] != saved["total_rows"]:
+            raise ValueError("Checkpoint collection is incomplete")
+        if resume:
+            return resume
         step = saved["optimizer_steps"]
 
     if step >= config.max_steps:
-        if resume:
-            return resume
         raise ValueError("Optimizer step budget is exhausted")
-    updates = min((len(requests) - start) // config.optimizer_rows, config.max_steps - step)
-    end = start + updates * config.optimizer_rows
 
     torch.manual_seed(config.seed)
     random.seed(config.seed)
@@ -243,73 +240,60 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
     work.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         (durable / "metrics").mkdir(parents=True, exist_ok=True)
-    copies = []
-    with ThreadPoolExecutor(max_workers=1) as worker:
-        def publish(done, loss, record):
-            rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
-                   "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else [],
-                   "cuda_device": torch.cuda.current_device() if device == "cuda" else None}
-            rank_rng_states = [None] * world_size if rank == 0 else None
-            if parallel:
-                dist.gather_object(rng, rank_rng_states, dst=0)
-            else:
-                rank_rng_states = [rng]
-            if rank == 0:
-                stop_reason = ("max_steps" if step >= config.max_steps else
-                               "collection_remainder" if done < len(requests) else "collection_complete")
-                snapshot = save_checkpoint((a, b), optimizer, scheduler, config,
-                    {"rows_done": done, "total_rows": len(requests), "optimizer_steps": step,
-                     "data_hash": data_hash, "base_identity": base_identity, "last_loss": loss,
-                     "last_audit": record, "stop_reason": stop_reason,
-                     "world_size": world_size}, work / f"rows_{done:06d}", rank_rng_states)
-                copies.append(worker.submit(copy_checkpoint, snapshot, durable))
+    loss, record = None, None
+    if requests:
+        pair_count = sum(len(pairs[row.id]) for row in requests)
+        optimizer.zero_grad(set_to_none=True)
+        audit = LossAudit()
+        for row in requests[rank::world_size]:
+            contribution = backward_row(row, pairs[row.id], (a, b, reference), tokenizer,
+                                        len(requests), pair_count, config)
+            audit.L_sys += contribution.L_sys
+            audit.L_A += contribution.L_A
 
-        for offset in range(start, end, config.optimizer_rows):
-            for future in copies:
-                if future.done():
-                    future.result()
-            batch = requests[offset:min(offset + config.optimizer_rows, end)]
-            pair_count = sum(len(pairs[row.id]) for row in batch)
-            optimizer.zero_grad(set_to_none=True)
-            audit = LossAudit()
-            for row in batch[rank::world_size]:
-                contribution = backward_row(row, pairs[row.id], (a, b, reference), tokenizer,
-                                            len(batch), pair_count, config)
-                audit.L_sys += contribution.L_sys
-                audit.L_A += contribution.L_A
+        if parallel:
+            for parameter in parameters:
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
+                dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            combined_loss = torch.tensor([audit.L_sys, audit.L_A], device=device, dtype=torch.float64)
+            dist.all_reduce(combined_loss, op=dist.ReduceOp.SUM)
+            audit = LossAudit(*combined_loss.tolist())
 
-            if parallel:
-                for parameter in parameters:
-                    if parameter.grad is None:
-                        parameter.grad = torch.zeros_like(parameter)
-                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-                combined_loss = torch.tensor([audit.L_sys, audit.L_A], device=device, dtype=torch.float64)
-                dist.all_reduce(combined_loss, op=dist.ReduceOp.SUM)
-                audit = LossAudit(*combined_loss.tolist())
-            loss = audit.L_total
-            torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
-            optimizer.step()
-            scheduler.step()
-            step += 1
-            done = offset + len(batch)
-            record = {**asdict(audit), "L_A_weighted": audit.L_A_weighted, "L_total": loss,
-                      "lambda_A": LAMBDA_A, "step": step, "rows_done": done,
-                      "batch_rows": len(batch), "pairs": pair_count, "workers": world_size}
-            if rank == 0:
-                save_json(durable / "metrics" / f"step_{step:06d}.json", record)
-                print(f"rows={done}/{len(requests)} step={step} loss={loss:.6f} pairs={pair_count} workers={world_size} "
-                      f"L_sys={audit.L_sys:.6f} L_A={audit.L_A:.6f} L_A_weighted={audit.L_A_weighted:.6f}", flush=True)
-            if done // config.checkpoint_rows > offset // config.checkpoint_rows or done == end:
-                publish(done, loss, record)
-        if start == end and not resume:
-            publish(end, None, None)
-        for future in copies:
-            future.result()
+        loss = audit.L_total
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+        optimizer.step()
+        scheduler.step()
+        step += 1
+        record = {**asdict(audit), "L_A_weighted": audit.L_A_weighted, "L_total": loss,
+                  "lambda_A": LAMBDA_A, "step": step, "rows_done": len(requests),
+                  "batch_rows": len(requests), "pairs": pair_count, "workers": world_size}
+        if rank == 0:
+            save_json(durable / "metrics" / f"step_{step:06d}.json", record)
+            print(f"rows={len(requests)}/{len(requests)} step={step} loss={loss:.6f} "
+                  f"pairs={pair_count} workers={world_size} L_sys={audit.L_sys:.6f} "
+                  f"L_A={audit.L_A:.6f} L_A_weighted={audit.L_A_weighted:.6f}", flush=True)
+
+    rng = {"torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
+           "cuda_rng": torch.cuda.get_rng_state_all() if device == "cuda" else [],
+           "cuda_device": torch.cuda.current_device() if device == "cuda" else None}
+    rank_rng_states = [None] * world_size if rank == 0 else None
+    if parallel:
+        dist.gather_object(rng, rank_rng_states, dst=0)
+    else:
+        rank_rng_states = [rng]
+
+    if rank == 0:
+        snapshot = save_checkpoint((a, b), optimizer, scheduler, config,
+            {"rows_done": len(requests), "total_rows": len(requests), "optimizer_steps": step,
+             "data_hash": data_hash, "base_identity": base_identity, "last_loss": loss,
+             "last_audit": record,
+             "stop_reason": "max_steps" if step >= config.max_steps else "collection_complete",
+             "world_size": world_size}, work / f"rows_{len(requests):06d}", rank_rng_states)
+        copy_checkpoint(snapshot, durable)
     if parallel:
         dist.barrier()
-    final = durable / f"rows_{end:06d}"
+    final = durable / f"rows_{len(requests):06d}"
     if not (final / "complete").exists():
         raise RuntimeError("Final durable checkpoint is missing")
     return final
-
-
