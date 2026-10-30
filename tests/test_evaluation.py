@@ -20,15 +20,19 @@ from tests.test_interfaces import decision
 class EvaluationTests(unittest.TestCase):
     def test_submission_queue_completion_and_resume(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
-            root = Path(temporary)
-            output = root / "evaluation"
+            root = Path(temporary).resolve()
+            output = root / "evaluations/source"
+            (root / "runs/source").mkdir(parents=True)
+            save_json(root / "runs/source/experiment.json", {"max_tokens": 512})
             commands = []
 
             def submit(args, **kwargs):
                 commands.append(args)
                 if args[0] == "sbatch":
                     self.assertIn("--nodes=1", args)
-                    self.assertIn("--ntasks=4", args)
+                    self.assertIn("--gres=gpu:4", args)
+                    self.assertIn("--cpus-per-task=16", args)
+                    self.assertEqual(args[-1], "4")
                     self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
                     self.assertIsNone(json.loads((output / "generate_job.json").read_text())["job_id"])
                     return CompletedProcess(args, 0, "123\n")
@@ -37,13 +41,14 @@ class EvaluationTests(unittest.TestCase):
                 (output / "generation.ready").touch()
                 return CompletedProcess(args, 0, "COMPLETED|0:0\n")
 
-            with patch("multi_llm.evaluate.prepare_evaluation", return_value=root / "checkpoint"), \
+            with patch("multi_llm.evaluate.prepare_evaluation", return_value=root / "checkpoint") as prepare, \
                     patch("multi_llm.evaluate.subprocess.run", side_effect=submit), \
                     patch("multi_llm.evaluate.time.sleep") as sleep, \
                     patch("multi_llm.evaluate.judge") as judge, \
                     patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}):
-                run(root, "source", output, gpus=4)
-                run(root, "source", output, gpus=4)
+                run(root, "source", gpus=4)
+                run(root, "source", gpus=4)
+            prepare.assert_called_with(root, "source", output, 512)
             self.assertEqual(len(commands), 3)
             sleep.assert_called_once_with(15)
             self.assertEqual(judge.call_count, 2)
@@ -57,7 +62,7 @@ class EvaluationTests(unittest.TestCase):
                               return_value=CompletedProcess([], 0, state)) as command, \
                         patch("multi_llm.evaluate.judge") as judge:
                     with self.assertRaises(RuntimeError):
-                        run(root, "source", output)
+                        run(root, "source")
                     judge.assert_not_called()
                     self.assertTrue(all(call.args[0][0] == "sacct" for call in command.call_args_list))
 
@@ -144,7 +149,7 @@ class EvaluationTests(unittest.TestCase):
                     patch("core.model_api.call_judge", return_value=decision("tie")) as api:
                 judge(output, workers=2)
                 judge(output, workers=2)
-            self.assertEqual(api.call_count, 3)
+            self.assertEqual(api.call_count, 4)
             self.assertEqual(api.call_args.kwargs["criteria"], FINAL_CRITERIA)
             self.assertEqual(api.call_args.kwargs["model"], manifest["judge"])
             summary = json.loads((output / "summary.json").read_text())
@@ -155,24 +160,29 @@ class EvaluationTests(unittest.TestCase):
             directory = Path(temporary)
             (directory / "calls").mkdir()
             record = {"id": 9, "question": "x", "system": "", "chosen": "c",
-                      "trained": {"z": {"text": "t"}}, "prompted": {"z": {"text": "b"}}}
+                      "trained": {"y": {"text": "dt"}, "z": {"text": "t"}},
+                      "prompted": {"y": {"text": "db"}, "z": {"text": "b"}}}
             with patch("core.model_api.call_judge", return_value=decision("option1")):
                 score = final_comparison(directory, record, "trained_vs_chosen")
             saved = json.loads((directory / "calls/9_trained_vs_chosen.json").read_text())
             self.assertEqual(score, float(saved["presented_order"][0] == "trained"))
+            with patch("core.model_api.call_judge", return_value=decision("option1")) as api:
+                final_comparison(directory, record, "trained_a_vs_prompted_a")
+            self.assertEqual({api.call_args.args[0][key] for key in ("candidate_1", "candidate_2")},
+                             {"dt", "db"})
             record["prompted"]["z"]["text"] = "t"
             with patch("core.model_api.call_judge") as api:
                 self.assertEqual(final_comparison(directory, record, "trained_vs_prompted"), 0.5)
                 api.assert_not_called()
 
-    def test_zero_judge_workers_submit_no_gpu_work(self):
+    def test_unsupported_gpu_count_submits_no_gpu_work(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             root = Path(temporary)
             with patch("multi_llm.evaluate.subprocess.run") as commands:
-                with self.assertRaisesRegex(ValueError, "Workers must be positive"):
-                    run(root, "source", root / "evaluation", workers=0)
+                with self.assertRaisesRegex(ValueError, "GPUs must be one of"):
+                    run(root, "source", gpus=3)
                 commands.assert_not_called()
-            self.assertFalse((root / "evaluation").exists())
+            self.assertFalse((root / "evaluations").exists())
 
     def test_greedy_generation_uses_completion_only(self):
         from multi_llm.evaluate import generate_answer

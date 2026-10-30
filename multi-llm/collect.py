@@ -57,6 +57,9 @@ def collect(base, data, output, publish, offset=0, count=None, checkpoint=None,
         dist.barrier()
 
     tokenizer = AutoTokenizer.from_pretrained(base, local_files_only=True)
+    # Finished beam groups emit pad; if pad is EOS, the diversity penalty stops later groups from ending.
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        raise ValueError("Beam search needs a pad token distinct from EOS")
     model = AutoModelForCausalLM.from_pretrained(base, local_files_only=True,
         torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32, attn_implementation="sdpa")
     if checkpoint:
@@ -85,7 +88,7 @@ def collect(base, data, output, publish, offset=0, count=None, checkpoint=None,
                 sequences = model.generate(input_ids=tokens, attention_mask=torch.ones_like(tokens),
                     num_beams=beams, num_beam_groups=beams, num_return_sequences=beams, diversity_penalty=10.0,
                     do_sample=False, temperature=1.0, top_p=1.0, max_new_tokens=max_tokens,
-                    pad_token_id=tokenizer.eos_token_id)
+                    pad_token_id=tokenizer.pad_token_id)
 
             for index, sequence in enumerate(sequences, 1):
                 completion = sequence[tokens.shape[1]:].tolist()

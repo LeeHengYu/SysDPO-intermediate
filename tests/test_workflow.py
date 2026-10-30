@@ -52,7 +52,7 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(round_size=size):
                     calls = []
 
-                    def fake_job(stage, project, directory, previous, max_tokens):
+                    def fake_job(stage, project, directory, previous, max_tokens, gpus):
                         calls.append((stage, directory, previous))
                         if stage == "train":
                             checkpoint = directory / "checkpoints" / "rows_000001"
@@ -65,7 +65,7 @@ class WorkflowTests(unittest.TestCase):
                             patch("multi_llm.pipeline.run_job", side_effect=fake_job), \
                             patch("multi_llm.pipeline.prepare_training"), \
                             patch("multi_llm.judge.judge_collection") as judge:
-                        pipeline(root, f"rounds{size}", len(rows), 8, TrainingConfig(), size)
+                        pipeline(root, f"rounds{size}", TrainingConfig(), size)
 
                     directory = root / "runs" / f"rounds{size}"
                     rounds = sorted(directory.glob("round_*"))
@@ -83,11 +83,11 @@ class WorkflowTests(unittest.TestCase):
                                          [("collect", item, previous), ("train", item, previous)])
 
                     with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}):
-                        with self.assertRaisesRegex(ValueError, "different configuration"):
-                            pipeline(root, f"rounds{size}", len(rows), 8, TrainingConfig(), size + 1)
+                        with self.assertRaisesRegex(ValueError, "different training configuration"):
+                            pipeline(root, f"rounds{size}", TrainingConfig(seed=1), size)
 
             with self.assertRaisesRegex(ValueError, "must be positive"):
-                pipeline(root, "invalid", len(rows), 8, TrainingConfig(), 0)
+                pipeline(root, "invalid", TrainingConfig(), 0)
         finally:
             shutil.rmtree(root)
 
@@ -124,6 +124,7 @@ class WorkflowTests(unittest.TestCase):
 
         class Tokenizer:
             eos_token_id = 0
+            pad_token_id = 3
 
             def apply_chat_template(self, messages, **kwargs):
                 return torch.tensor([[1, 2]])
@@ -143,7 +144,7 @@ class WorkflowTests(unittest.TestCase):
                     self.disabled = False
 
             def generate(self, input_ids, **kwargs):
-                calls.append((self.disabled, kwargs["num_beams"], kwargs["max_new_tokens"]))
+                calls.append((self.disabled, kwargs["num_beams"], kwargs["max_new_tokens"], kwargs["pad_token_id"]))
                 return torch.tensor([[1, 2, (20 if self.disabled else 10) + i, 0]
                                      for i in range(kwargs["num_return_sequences"])])
 
@@ -162,8 +163,13 @@ class WorkflowTests(unittest.TestCase):
             record = json.loads((root / "publish/question_0.json").read_text())
             self.assertEqual([record["y1"], record["y2"], record["y3"]], ["10", "11", "12"])
             self.assertEqual(record["reference_intermediates"], ["20", "21"])
-            self.assertEqual(calls, [(False, 3, 512), (True, 2, 512)])
+            self.assertEqual(calls, [(False, 3, 512, 3), (True, 2, 512, 3)])
             self.assertFalse(model.disabled)
+            Tokenizer.pad_token_id = Tokenizer.eos_token_id
+            with patch("multi_llm.collect.AutoTokenizer.from_pretrained", return_value=Tokenizer()), \
+                    self.assertRaisesRegex(ValueError, "distinct from EOS"):
+                collect(root / "base", root / "rows.json", root / "output", root / "publish",
+                        checkpoint=root / "checkpoint", device="cpu")
         finally:
             shutil.rmtree(root)
 
@@ -214,11 +220,11 @@ class WorkflowTests(unittest.TestCase):
                     script = Path(__file__).resolve().parents[1] / "script" / "job.sh"
                     self.assertEqual(args[args.index("--output") + 2], str(script))
                     self.assertTrue(script.is_file())
-                    self.assertEqual(args[-2], str(script.parent.parent))
-                    self.assertEqual(args[-1], "512")
+                    self.assertEqual(args[-3:], [str(script.parent.parent), "512", "4"])
                     self.assertNotIn("OPENROUTER_KEY", kwargs["env"])
-                    self.assertEqual(args[args.index("--ntasks") + 1], "4")
-                    self.assertEqual(args[args.index("--nodes") + 1], "1")
+                    self.assertIn("--gres=gpu:4", args)
+                    self.assertIn("--cpus-per-task=16", args)
+                    self.assertIn("--nodes=1", args)
                     self.assertIsNone(json.loads((root / f"{stage}_job.json").read_text())["job_id"])
                     self.assertEqual(args[args.index("--time") + 1],
                                      "30:00:00" if stage == "collect" else "04:00:00")
@@ -226,12 +232,11 @@ class WorkflowTests(unittest.TestCase):
                 (root / ("training.ready" if stage == "train" else "candidates.ready")).touch()
                 return CompletedProcess(args, 0, "COMPLETED|0:0|\n", "")
 
-            with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only",
-                                         "SBATCH_NTASKS": "4", "SBATCH_NODES": "1"}), \
+            with patch.dict(os.environ, {"OPENROUTER_KEY": "test-only"}), \
                     patch("multi_llm.pipeline.subprocess.run", side_effect=command) as submitted:
                 for stage in ("train", "collect"):
-                    run_job(stage, root, root, max_tokens=512)
-                    run_job(stage, root, root, max_tokens=512)
+                    run_job(stage, root, root, max_tokens=512, gpus=4)
+                    run_job(stage, root, root, max_tokens=512, gpus=4)
             self.assertEqual(submitted.call_count, 4)
             self.assertEqual(json.loads((root / "train_job.json").read_text())["job_id"], "123")
         finally:
@@ -249,13 +254,6 @@ class WorkflowTests(unittest.TestCase):
                         run_job("train", root, root)
                     self.assertTrue(all(call.args[0][0] == "sacct" for call in commands.call_args_list))
                 self.assertFalse((root / "training.ready").exists())
-            (root / "train_job.json").unlink()
-            with patch.dict(os.environ, {"SBATCH_NODES": "2"}), \
-                    patch("multi_llm.pipeline.subprocess.run") as commands:
-                with self.assertRaisesRegex(ValueError, "one node"):
-                    run_job("train", root, root)
-                commands.assert_not_called()
-                self.assertFalse((root / "train_job.json").exists())
 
     def test_parallel_pairs_cycles_and_duplicate_prefilter(self):
         root = Path(__file__).parent / ("judge_test_" + uuid.uuid4().hex)

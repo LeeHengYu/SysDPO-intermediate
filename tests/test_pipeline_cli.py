@@ -1,4 +1,4 @@
-"""Pipeline selection, checkpoint continuation and read-only reporting."""
+"""Pipeline selection, in-place resume and read-only reporting."""
 
 from contextlib import redirect_stdout
 from dataclasses import asdict
@@ -32,10 +32,16 @@ class PipelineCliTests(unittest.TestCase):
         save_json(self.root / "data/train.json", self.rows)
         self.config = TrainingConfig(warmup_steps=3, seed=7)
         self.jobs = []
+        self.fail_train = set()
 
-        def fake_job(stage, root, current, previous, max_tokens):
-            self.jobs.append((stage, current, previous, max_tokens))
+        def fake_job(stage, root, current, previous, max_tokens, gpus):
+            # Like run_job, a stage with its ready marker is skipped.
+            if (current / ("training.ready" if stage == "train" else "candidates.ready")).exists():
+                return
+            self.jobs.append((stage, current, previous, max_tokens, gpus))
             if stage == "train":
+                if current.name in self.fail_train:
+                    raise RuntimeError("train job failed")
                 selected = json.loads((current / "rows.json").read_text())
                 config = json.loads((current / "training_config.json").read_text())
                 prior_step = json.loads((previous / "state.json").read_text())["optimizer_steps"] if previous else 0
@@ -58,17 +64,18 @@ class PipelineCliTests(unittest.TestCase):
             mocked.start()
             self.addCleanup(mocked.stop)
 
-    def source_run(self, start=2, count=4, legacy=False):
+    def collected(self, run):
+        directory = self.root / "runs" / run
+        return [json.loads(path.read_text()) for path in sorted(directory.glob("round_*/rows.json"))]
+
+    def source_run(self, start=2, count=4):
         directory = self.root / "runs/source"
         current = directory / "round_000"
         checkpoint = current / "checkpoints/rows_000002"
         checkpoint.mkdir(parents=True)
         rows = self.rows[start:start + count]
-        manifest = {"row_ids": [row["id"] for row in rows],
-                    "training": asdict(self.config), "round_size": 1024}
-        if not legacy:
-            manifest["start_offset"] = start
-        save_json(directory / "experiment.json", manifest)
+        save_json(directory / "experiment.json", {"training": asdict(self.config), "round_size": 1024,
+                                                  "start_offset": start})
         save_json(current / "rows.json", rows)
         save_json(checkpoint / "state.json", {
             "rows_done": 2, "total_rows": 2, "optimizer_steps": 12,
@@ -78,103 +85,62 @@ class PipelineCliTests(unittest.TestCase):
         (current / "training.ready").touch()
         return checkpoint
 
-    def test_continuation_inherits_config_offset_and_pins_checkpoint(self):
-        checkpoint = self.source_run()
-        pending = self.root / "runs/source/round_001"
-        partial = pending / "checkpoints/rows_000001"
-        partial.mkdir(parents=True)
-        save_json(pending / "rows.json", self.rows[6:8])
-        save_json(partial / "state.json", {
-            "rows_done": 1, "total_rows": 2, "optimizer_steps": 13,
-            "config": asdict(self.config),
-        })
-        (partial / "complete").touch()
-        path = self.root / "runs/source/experiment.json"
-        parent = json.loads(path.read_text())
-        parent["row_ids"] += [row["id"] for row in self.rows[6:8]]
-        save_json(path, parent)
+    def test_rerun_resumes_interrupted_round_and_resizes_only_new_rounds(self):
+        self.fail_train.add("round_001")
+        with self.assertRaisesRegex(RuntimeError, "train job failed"):
+            main(["--root", str(self.root), "--run", "resumed", "--round-size", "4", "--gpus", "2"])
+        self.fail_train.clear()
+        self.jobs.clear()
 
-        main(["--root", str(self.root), "--run", "child", "--from-run", "source",
-              "--questions", "3", "--round-size", "2", "--max-tokens", "256"])
-        manifest = json.loads((self.root / "runs/child/experiment.json").read_text())
-        self.assertEqual(manifest["row_ids"], [16, 17, 18])
-        self.assertEqual(manifest["start_offset"], 6)
-        self.assertEqual(manifest["training"], asdict(self.config))
-        self.assertEqual(manifest["previous"], str(checkpoint))
-        self.assertEqual(self.jobs[0][2], checkpoint)
-        self.assertTrue(all(job[3] == 256 for job in self.jobs))
-
-        pipeline(self.root, "grandchild", 2, 8, from_run="child")
-        grandchild = json.loads((self.root / "runs/grandchild/experiment.json").read_text())
-        self.assertEqual(grandchild["start_offset"], 9)
-        self.assertEqual(grandchild["row_ids"], [19, 20])
-
-        state = json.loads((partial / "state.json").read_text())
-        state["rows_done"] = 2
-        save_json(partial / "state.json", state)
-        (pending / "training.ready").touch()
-        pipeline(self.root, "child", 3, 8, round_size=2, from_run="source", max_tokens=256)
-        self.assertEqual(json.loads((self.root / "runs/child/experiment.json").read_text()), manifest)
-
-    def test_all_selects_remaining_rows_and_offset_can_be_overridden(self):
-        self.source_run()
-        pipeline(self.root, "remaining", "all", 8, from_run="source")
-        selected = json.loads((self.root / "runs/remaining/experiment.json").read_text())
-        self.assertEqual(selected["row_ids"], [16, 17, 18, 19, 20, 21])
-
-        pipeline(self.root, "override", 2, 8, from_run="source", start_offset=9)
-        selected = json.loads((self.root / "runs/override/experiment.json").read_text())
-        self.assertEqual(selected["row_ids"], [19, 20])
-
-        main(["--root", str(self.root), "--run", "offset_only", "--start-offset", "10",
-              "--questions", "all"])
-        selected = json.loads((self.root / "runs/offset_only/experiment.json").read_text())
+        main(["--root", str(self.root), "--run", "resumed", "--round-size", "2", "--gpus", "4"])
+        groups = self.collected("resumed")
+        self.assertEqual([len(group) for group in groups], [4, 4, 2, 2])
         shuffled = list(self.rows)
         random.Random(TrainingConfig().seed).shuffle(shuffled)
-        self.assertEqual(selected["row_ids"], [row["id"] for row in shuffled[10:]])
+        self.assertEqual([row for group in groups for row in group], shuffled)
+        self.assertEqual(self.jobs[0][:2], ("train", self.root / "runs/resumed/round_001"))
+        self.assertEqual(self.jobs[0][2], self.root / "runs/resumed/round_000/checkpoints/rows_000001")
+        self.assertTrue(all(job[3] == 512 and job[4] == 4 for job in self.jobs))
+        manifest = json.loads((self.root / "runs/resumed/experiment.json").read_text())
+        self.assertEqual(manifest["round_size"], 2)
 
-    def test_legacy_manifest_can_resume_and_be_used_as_source(self):
-        self.source_run(start=0, legacy=True)
-        pipeline(self.root, "child", 2, 8, from_run="source")
-        selected = json.loads((self.root / "runs/child/experiment.json").read_text())
-        self.assertEqual(selected["start_offset"], 4)
-        pipeline(self.root, "source", 4, 8, self.config, round_size=1024, max_tokens=1024)
+        self.jobs.clear()
+        pipeline(self.root, "resumed")
+        self.assertEqual(self.jobs, [])
+        self.assertEqual(len(self.collected("resumed")), 4)
 
-    def test_shuffle_is_stable_for_resume_and_continuation(self):
-        pipeline(self.root, "shuffled", 4, 8, self.config, round_size=2)
-        path = self.root / "runs/shuffled/experiment.json"
-        manifest = json.loads(path.read_text())
-        shuffled = list(self.rows)
-        random.Random(self.config.seed).shuffle(shuffled)
-        self.assertEqual(manifest["row_ids"], [row["id"] for row in shuffled[:4]])
-        pipeline(self.root, "shuffled", 4, 8, self.config, round_size=2)
-        self.assertEqual(json.loads(path.read_text()), manifest)
+    def test_legacy_continuation_manifest_resumes_from_its_pinned_checkpoint(self):
+        checkpoint = self.source_run()
+        directory = self.root / "runs/child"
+        directory.mkdir()
+        save_json(directory / "experiment.json", {
+            "row_ids": [row["id"] for row in self.rows[6:]], "training": asdict(self.config),
+            "round_size": 3, "start_offset": 6, "max_tokens": 256, "from_run": "source",
+            "previous": str(checkpoint), "shuffle": False})
+        pipeline(self.root, "child")
+        self.assertEqual(self.collected("child"), [self.rows[6:9], self.rows[9:12]])
+        self.assertEqual(self.jobs[0][2], checkpoint)
+        self.assertTrue(all(job[3] == 256 for job in self.jobs))
+        manifest = json.loads((directory / "experiment.json").read_text())
+        self.assertEqual(manifest["from_run"], "source")
 
-        pipeline(self.root, "next", 2, 8, from_run="shuffled")
-        child = json.loads((self.root / "runs/next/experiment.json").read_text())
-        self.assertEqual(child["row_ids"], [row["id"] for row in shuffled[4:6]])
+    def test_oldest_manifest_keeps_its_token_cap_and_unshuffled_order(self):
+        directory = self.root / "runs/old"
+        directory.mkdir(parents=True)
+        save_json(directory / "experiment.json", {"training": asdict(self.config), "round_size": 6})
+        pipeline(self.root, "old")
+        self.assertEqual(self.collected("old"), [self.rows[:6], self.rows[6:]])
+        self.assertTrue(all(job[3] == 1024 for job in self.jobs))
 
-    def test_cap_stops_new_collection_and_pins_partial_terminal_checkpoint(self):
+    def test_cap_stops_new_collection_and_rerun_submits_nothing(self):
         config = TrainingConfig(max_steps=2)
-        pipeline(self.root, "capped", "all", 8, config, round_size=2)
+        pipeline(self.root, "capped", config, round_size=2)
         directory = self.root / "runs/capped"
         self.assertEqual(len(list(directory.glob("round_*"))), 2)
         self.assertEqual(len(self.jobs), 4)
-        terminal = directory / "round_001/checkpoints/rows_000001"
-        state = json.loads((terminal / "state.json").read_text())
-        state.update(rows_done=1, stop_reason="max_steps")
-        save_json(terminal / "state.json", state)
         self.jobs.clear()
-        pipeline(self.root, "after_cap", "all", 8, from_run="capped")
-        child = json.loads((self.root / "runs/after_cap/experiment.json").read_text())
-        self.assertEqual(child["previous"], str(terminal))
+        pipeline(self.root, "capped", round_size=3)
         self.assertEqual(self.jobs, [])
-
-    def test_zero_judge_workers_submit_no_gpu_work(self):
-        with self.assertRaisesRegex(ValueError, "workers must be positive"):
-            pipeline(self.root, "invalid_workers", "all", 0)
-        self.assertEqual(self.jobs, [])
-        self.assertFalse((self.root / "runs/invalid_workers").exists())
 
     def test_fixed_rounds_do_not_refill_or_overlap(self):
         config = TrainingConfig(optimizer_rows=4, max_steps=2)
@@ -187,7 +153,7 @@ class PipelineCliTests(unittest.TestCase):
             save_json(current / "intermediate_preferences.json", [])
             (current / "preferences.ready").touch()
 
-        def job(stage, root, current, previous, max_tokens):
+        def job(stage, root, current, previous, max_tokens, gpus):
             marker = current / ("candidates.ready" if stage == "collect" else "training.ready")
             if marker.exists():
                 return
@@ -212,9 +178,9 @@ class PipelineCliTests(unittest.TestCase):
         with patch("multi_llm.pipeline.run_job", side_effect=job), \
                 patch("multi_llm.pipeline.prepare_training", side_effect=prepare_training), \
                 patch("multi_llm.judge.judge_collection", side_effect=judge):
-            pipeline(self.root, "aligned", "all", 8, config, round_size=4)
+            pipeline(self.root, "aligned", config, round_size=4)
             self.assertEqual(events, [(4, 0), (4, 1), (4, 1)])
-            pipeline(self.root, "aligned", "all", 8, config, round_size=4)
+            pipeline(self.root, "aligned", config, round_size=4)
             self.assertEqual(events, [(4, 0), (4, 1), (4, 1)])
         directory = self.root / "runs/aligned"
         self.assertEqual(len(list(directory.glob("round_*"))), 3)
@@ -248,36 +214,19 @@ class PipelineCliTests(unittest.TestCase):
         prepare_training(current, config)
         self.assertEqual(json.loads((current / "training/scoring_requests.json").read_text()), selected)
 
-    def test_invalid_selections_and_changed_configuration_submit_nothing(self):
-        self.source_run()
-        for options in (
-            {"start_offset": -1}, {"start_offset": len(self.rows)}, {"questions": 0},
-            {"max_tokens": 0}, {"from_run": "source", "config": TrainingConfig()},
-            {"from_run": "bad/name"},
-        ):
+    def test_invalid_settings_and_changed_data_submit_nothing(self):
+        for options in ({"gpus": 3}, {"round_size": 0}):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                pipeline(self.root, "invalid", options.get("questions", 2), 8,
-                         **{key: value for key, value in options.items() if key != "questions"})
-        self.assertEqual(self.jobs, [])
+                pipeline(self.root, "invalid", **options)
+        self.assertFalse((self.root / "runs/invalid").exists())
 
-        pipeline(self.root, "fixed", 2, 8, max_tokens=512)
+        pipeline(self.root, "fixed", self.config, round_size=6)
         self.jobs.clear()
-        with self.assertRaisesRegex(ValueError, "different configuration"):
-            pipeline(self.root, "fixed", 2, 8, max_tokens=256)
-        self.assertEqual(self.jobs, [])
-
-    def test_source_must_be_complete_and_match_dataset(self):
-        checkpoint = self.source_run()
-        pending = checkpoint.parent / "rows_000003.partial"
-        pending.mkdir()
-        (pending / "complete").touch()
-        (checkpoint / "complete").unlink()
-        with self.assertRaisesRegex(ValueError, "no completed training round"):
-            pipeline(self.root, "child", 2, 8, from_run="source")
-        (checkpoint / "complete").touch()
+        with self.assertRaisesRegex(ValueError, "different training configuration"):
+            pipeline(self.root, "fixed", TrainingConfig())
         save_json(self.root / "data/train.json", list(reversed(self.rows)))
         with self.assertRaisesRegex(ValueError, "do not match"):
-            pipeline(self.root, "child", 2, 8, from_run="source")
+            pipeline(self.root, "fixed")
         self.assertEqual(self.jobs, [])
 
     def test_status_reports_saved_vs_logged_progress_without_writes(self):
@@ -307,6 +256,7 @@ class PipelineCliTests(unittest.TestCase):
             main(["--root", str(self.root), "--run", "source", "--status",
                   "--config", str(self.root / "does_not_exist.json")])
         text = output.getvalue()
+        self.assertIn("Training-split start: 2", text)
         self.assertIn("Collected: 1/4", text)
         self.assertIn("Train: RUNNING", text)
         self.assertIn("attempted: 2 | successful: 1", text)

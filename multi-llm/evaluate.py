@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import sys
 import time
 
 from core.schemas import DatasetRow, Prompts
@@ -27,9 +28,11 @@ FINAL_CRITERIA = {
     "option2": "candidate_2 is the better final answer under the rubric.",
     "tie": "The answers have no material quality difference or are equally good or bad.",
 }
-COMPARISONS = {"trained_vs_chosen": ("trained", "chosen"),
-               "trained_vs_prompted": ("trained", "prompted"),
-               "prompted_vs_chosen": ("prompted", "chosen")}
+# (first, second, stage): stage "z" compares B's final answers, "y" compares A's drafts.
+COMPARISONS = {"trained_vs_chosen": ("trained", "chosen", "z"),
+               "trained_vs_prompted": ("trained", "prompted", "z"),
+               "prompted_vs_chosen": ("prompted", "chosen", "z"),
+               "trained_a_vs_prompted_a": ("trained", "prompted", "y")}
 
 
 def prepare_evaluation(root, run, output, max_tokens):
@@ -170,8 +173,8 @@ def export_outputs(directory):
 def final_comparison(directory, record, name):
     from core.model_api import call_judge
 
-    first, second = COMPARISONS[name]
-    candidates = {variant: record["chosen"] if variant == "chosen" else record[variant]["z"]["text"]
+    first, second, stage = COMPARISONS[name]
+    candidates = {variant: record["chosen"] if variant == "chosen" else record[variant][stage]["text"]
                   for variant in (first, second)}
     order = [first, second]
     random.Random(f"42:{record['id']}:{name}").shuffle(order)
@@ -240,9 +243,18 @@ def judge(directory, workers=8):
     (directory / "evaluation.ready").write_text("complete\n")
 
 
-def run(root, run, output, max_tokens=256, gpus=2, workers=8):
+def run(root, run, gpus=1):
+    """Evaluate a run's final checkpoint in evaluations/<run>, reusing saved generations and judgments."""
     import fcntl
+    from multi_llm.pipeline import GPU_CHOICES, JUDGE_WORKERS, read_manifest, wait_job
+    from multi_llm.runs import run_directory
 
+    if gpus not in GPU_CHOICES:
+        raise ValueError(f"GPUs must be one of {GPU_CHOICES}")
+    root = root.resolve()
+    # Generate with the same new-token cap the run trained with.
+    max_tokens = read_manifest(run_directory(root, run) / "experiment.json")["max_tokens"]
+    output = root / "evaluations" / run
     output.mkdir(parents=True, exist_ok=True)
     with (output / "coordinator.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -256,9 +268,9 @@ def run(root, run, output, max_tokens=256, gpus=2, workers=8):
             else:
                 code = Path(__file__).resolve().parent.parent
                 save_json(job_path, {"job_id": None, "code": str(code)})
-                result = subprocess.run(["sbatch", "--parsable", "--nodes=1", f"--ntasks={gpus}",
-                    "--output", str(output / "generate_%j.log"), str(code / "script/evaluate.sh"),
-                    str(root), str(output), str(checkpoint), str(code)],
+                result = subprocess.run(["sbatch", "--parsable", "--nodes=1", f"--gres=gpu:{gpus}",
+                    f"--cpus-per-task={4 * gpus}", "--output", str(output / "generate_%j.log"), str(code / "script/evaluate.sh"),
+                    str(root), str(output), str(checkpoint), str(code), str(gpus)],
                     check=True, capture_output=True, text=True,
                     env={key: value for key, value in os.environ.items() if key != "OPENROUTER_KEY"})
                 job = result.stdout.strip().split(";")[0]
@@ -266,46 +278,28 @@ def run(root, run, output, max_tokens=256, gpus=2, workers=8):
                     raise RuntimeError(f"Invalid submission: {result.stdout}")
                 save_json(job_path, {"job_id": job, "code": str(code), "gpus": gpus})
             print(f"Evaluation generation: Slurm job {job}", flush=True)
-            while True:
-                result = subprocess.run(["sacct", "-nX", "-P", "-j", job, "--format=State,ExitCode"],
-                                        check=True, capture_output=True, text=True)
-                states = [line.split("|") for line in result.stdout.splitlines() if line.strip()]
-                if states:
-                    state, exit_code = states[0][:2]
-                    if state == "COMPLETED":
-                        if exit_code != "0:0" or not (output / "generation.ready").exists():
-                            raise RuntimeError("Evaluation job lacks complete outputs")
-                        break
-                    if state.split()[0].rstrip("+") in {"FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
-                                                        "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}:
-                        raise RuntimeError(f"Evaluation job {job}: {state} {exit_code}")
-                time.sleep(15)
-        judge(output, workers)
+            wait_job(job, output / "generation.ready")
+        judge(output, JUDGE_WORKERS)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(description=__doc__)
+    if argv[:1] == ["generate"]:
+        # Internal entry point for script/evaluate.sh on the compute node.
+        for name in ("base", "checkpoint", "directory"):
+            parser.add_argument(f"--{name}", type=Path, required=True)
+        from core.distributed import distributed_job
+        with distributed_job():
+            generate(**vars(parser.parse_args(argv[1:])))
+        return
+
+    from multi_llm.pipeline import GPU_CHOICES
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--run", required=True, help="Run under runs/; output goes to evaluations/<run>")
+    parser.add_argument("--gpus", type=int, choices=GPU_CHOICES, default=1, help="GPUs for generation")
+    run(**vars(parser.parse_args(argv)))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="phase", required=True)
-    launch = sub.add_parser("run", help="Management node: submit GPU generation, then judge")
-    launch.add_argument("--root", type=Path, required=True)
-    launch.add_argument("--run", required=True)
-    launch.add_argument("--output", type=Path, required=True)
-    launch.add_argument("--max-tokens", type=int, default=256)
-    launch.add_argument("--gpus", type=int, choices=(1, 2, 4), default=2)
-    launch.add_argument("--workers", type=int, default=8)
-    gpu = sub.add_parser("generate", help="Offline compute node")
-    for name in ("base", "checkpoint", "directory"):
-        gpu.add_argument(f"--{name}", type=Path, required=True)
-    assess = sub.add_parser("judge", help="Management node: reuse saved generations and judgments")
-    assess.add_argument("--directory", type=Path, required=True)
-    assess.add_argument("--workers", type=int, default=8)
-    args = vars(parser.parse_args())
-    phase = args.pop("phase")
-    if phase == "generate":
-        from core.distributed import distributed_job
-        with distributed_job():
-            generate(**args)
-    elif phase == "judge":
-        judge(**args)
-    else:
-        run(**args)
+    main()

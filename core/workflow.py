@@ -77,7 +77,6 @@ def judge_pair(output_dir, row: DatasetRow, first, second, stage, first_id, seco
             "candidate_1": candidates[order[0]], "candidate_2": candidates[order[1]]}
     task["instruction_policy"] = prompts.instruction_policy
     task["response_role"] = prompts.a_instruction
-    task["comparison_type"] = "intermediate"
 
     raw = recorded_call(output_dir, row.id, stage, JUDGE, [
         {"role": "system", "content": prompts.judge_rubric},

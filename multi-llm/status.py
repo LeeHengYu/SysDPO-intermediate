@@ -20,7 +20,7 @@ class RoundReport:
     cost: Decimal = Decimal("0")
 
 
-def read_round_status(current, jobs, states, optimizer_rows):
+def read_round_status(current, jobs, states):
     report = RoundReport(lines=[f"\n{current.name}"])
     if not (current / "rows.json").exists():
         report.lines.append("Preparing round metadata.")
@@ -69,10 +69,7 @@ def read_round_status(current, jobs, states, optimizer_rows):
         batches = re.findall(r"rows=(\d+)/(\d+) step=(\d+) loss=([\d.eE+-]+) pairs=(\d+)", log.read_text())
         if batches:
             done, total, step, loss, pairs = batches[-1]
-            batch_rows = int(done) - (int(batches[-2][0]) if len(batches) > 1 else 0)
             report.lines.append(f"Last logged: rows {done}/{total} | cumulative step {step} | loss {loss} | pairs {pairs}")
-            if len(batches) > 1 or int(done) <= optimizer_rows:
-                report.lines.append(f"Last logged batch: {batch_rows} rows")
 
     checkpoint = latest_checkpoint(current)
     if checkpoint:
@@ -105,9 +102,8 @@ def show_status(root, run):
             print("Slurm unavailable; showing saved progress only.")
 
     print(f"Run: {run}")
-    print(f"Selected questions: {len(manifest['row_ids'])} | collection round size: {manifest['round_size']}")
-    optimizer_rows = manifest["training"]["optimizer_rows"]
-    print(f"Optimizer batch: {optimizer_rows} rows")
+    print(f"Training-split start: {manifest.get('start_offset', 0)} | collection round size: {manifest['round_size']}")
+    print(f"Optimizer batch: {manifest['training']['optimizer_rows']} rows")
     if "max_steps" in manifest["training"]:
         print(f"Optimizer budget: {manifest['training']['max_steps']} cumulative steps")
     if manifest.get("previous"):
@@ -116,8 +112,7 @@ def show_status(root, run):
     total_calls, total_success, total_missing = 0, 0, 0
     total_cost = Decimal("0")
     with ThreadPoolExecutor(max_workers=8) as pool:
-        reports = [pool.submit(read_round_status, current, jobs, states,
-                               optimizer_rows) for current in rounds]
+        reports = [pool.submit(read_round_status, current, jobs, states) for current in rounds]
         for future in reports:
             report = future.result()
             print("\n".join(report.lines), flush=True)

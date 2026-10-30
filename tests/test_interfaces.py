@@ -167,14 +167,14 @@ class InterfaceChecks(unittest.TestCase):
                     workflow.recorded_call(output, 0, "judge", workflow.JUDGE, messages)
                 self.assertEqual(call.call_count, 1)
 
-    def test_intermediate_judge_receives_guidance_role_and_rubric(self):
+    def test_intermediate_judge_receives_response_role_and_rubric(self):
         prompts = workflow.load_prompts(workflow.PROMPT_FILE)
         row = DatasetRow(id=0, question="q", chosen="c", rejected="r")
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             output = Path(temporary)
             (output / "calls").mkdir()
             with patch("core.workflow.call_judge", return_value=decision()) as call:
-                workflow.judge_pair(output, row, "guide one", "guide two", "pair", "y1", "y2", prompts)
+                workflow.judge_pair(output, row, "answer one", "answer two", "pair", "y1", "y2", prompts)
             task, rubric = call.call_args.args
             self.assertEqual(task["response_role"], prompts.a_instruction)
             self.assertEqual(rubric, prompts.judge_rubric)

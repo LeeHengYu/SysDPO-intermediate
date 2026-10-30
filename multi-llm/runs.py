@@ -1,4 +1,4 @@
-"""Read saved run locations, checkpoints and dataset positions."""
+"""Read saved run locations and checkpoints."""
 
 import json
 from pathlib import Path
@@ -37,43 +37,3 @@ def prepare_training(directory, config):
     save_json(target / "selection.json", {"usable_rows": usable_count,
               "selected_row_ids": [row["id"] for row in requests], "seed": config.seed})
     (target / "inputs.ready").touch()
-
-
-def continuation(root, run, dataset, checkpoint=None):
-    directory = run_directory(root, run)
-    manifest = json.loads((directory / "experiment.json").read_text())
-    dataset = list(dataset)
-    if manifest.get("shuffle", False):
-        random.Random(manifest["training"]["seed"]).shuffle(dataset)
-    rounds = sorted(directory.glob("round_*"))
-
-    if checkpoint is None:
-        for current in reversed(rounds):
-            candidate = latest_checkpoint(current)
-            if candidate and (current / "training.ready").exists():
-                state = json.loads((candidate / "state.json").read_text())
-                if (state["rows_done"] == state["total_rows"]
-                        or state.get("stop_reason") == "max_steps"):
-                    checkpoint = candidate
-                    break
-        else:
-            raise ValueError("Source run has no completed training round")
-
-    checkpoint = Path(checkpoint)
-    current = checkpoint.parent.parent
-    state = json.loads((checkpoint / "state.json").read_text())
-    if (current.parent != directory or not (checkpoint / "complete").exists()
-            or not (current / "training.ready").exists()
-            or (state["rows_done"] != state["total_rows"]
-                and state.get("stop_reason") != "max_steps")):
-        raise ValueError("Source checkpoint is not a completed training round")
-
-    consumed = [row["id"] for item in rounds if item <= current
-                for row in json.loads((item / "rows.json").read_text())]
-    start = manifest.get("start_offset", 0)
-    end = start + len(consumed)
-    if ([row["id"] for row in dataset[start:end]] != consumed
-            or manifest["row_ids"][:len(consumed)] != consumed):
-        raise ValueError("Source run rows do not match the current training split")
-
-    return checkpoint, end, state["config"]

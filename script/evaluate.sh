@@ -3,9 +3,9 @@
 #SBATCH --partition=gpuh
 #SBATCH --qos=qos_research
 #SBATCH --nodes=1
-#SBATCH --ntasks=2
-#SBATCH --gpus-per-task=h100:1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
 
@@ -14,6 +14,7 @@ root=${1:?root required}
 output=${2:?evaluation directory required}
 checkpoint=${3:?checkpoint required}
 code=${4:?release required}
+gpus=${5:?GPU count required}
 scratch="/mnt/slurm_scratch/job_${SLURM_JOB_ID:?}"
 test -d "$scratch"
 test "$SLURM_JOB_NUM_NODES" -eq 1
@@ -28,7 +29,7 @@ cp "$checkpoint/complete" "$checkpoint/state.json" "$scratch/checkpoint/"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4
 export HF_HOME="$scratch/huggingface" TMPDIR="$scratch"
-srun --kill-on-bad-exit=1 --ntasks=1 --gpus-per-task="h100:$SLURM_NTASKS" --gpu-bind=none \
-    "$code/.venv/bin/python" -u -m torch.distributed.run --standalone \
-    --nproc-per-node="$SLURM_NTASKS" -m multi_llm.evaluate generate \
+echo "node=$(hostname) devices=${CUDA_VISIBLE_DEVICES:-unset} gpus=$gpus"
+"$code/.venv/bin/python" -u -m torch.distributed.run --standalone \
+    --nproc-per-node="$gpus" -m multi_llm.evaluate generate \
     --base "$scratch/base" --checkpoint "$scratch/checkpoint" --directory "$output"

@@ -1,6 +1,6 @@
 # SysDPO-extend
 
-Train a two-LLM system with system-level DPO and an additional preference loss on A's intermediate outputs. A produces guidance for B; B scores the dataset's chosen/rejected final answers during training and generates final answers during evaluation.
+Train a two-LLM system with system-level DPO and an additional preference loss on A's intermediate outputs. A drafts an answer and B refines it, as in SysDPO; B scores the dataset's chosen/rejected final answers during training and generates final answers during evaluation.
 
 ## Code layout
 
@@ -27,7 +27,7 @@ The GPU requirements include the base requirements. Strict editable mode exposes
 
 The management node runs the coordinator and network API calls; compute nodes run offline GPU stages. The pipeline requires Slurm and persistent storage accessible to both.
 
-Before deployment, adapt the Slurm directives in `script/job.sh` and `script/evaluate.sh`, GPU resource flags in the launch scripts, and scratch paths in `script/worker.sh` and `script/evaluate.sh` to your cluster.
+Before deployment, adapt the Slurm directives in `script/job.sh` and `script/evaluate.sh` and the scratch paths in `script/worker.sh` and `script/evaluate.sh` to your cluster. Jobs request GPUs with `--gres=gpu:N` and 4 CPUs per GPU on one node, following the [CUHK Business School HPC user guide](https://github.com/CUHK-Business-School-AI-Hub/ai_hub_HPC_user_guide).
 
 From the source checkout, provide your SSH destination and an absolute persistent project root:
 
@@ -55,25 +55,19 @@ Preparation downloads and pins `Qwen/Qwen1.5-1.8B-Chat` and `Intel/orca_dpo_pair
 Run from the installed source directory on the management node:
 
 ```sh
-SBATCH_NTASKS=4 SBATCH_NODES=1 \
 uv run --no-sync python -u -m multi_llm.pipeline \
-  --root "$PROJECT_ROOT" --run train \
-  --questions all --round-size 128 --max-tokens 512 --workers 8
+  --root "$PROJECT_ROOT" --run train --gpus 4 --round-size 128
 ```
 
-`SBATCH_NTASKS` sets the GPU worker count for collection and training. All workers must fit on one node. Keep the coordinator running, or detach the command with `nohup` and redirect its output to a log.
+Rerun the same command to resume. Keep the coordinator running, or detach it with `nohup` and redirect its output to a log.
 
 | Option | Meaning | Default |
 |---|---|---|
 | `--root PATH` | Persistent model, data and run root | Required |
-| `--run NAME` | Directory name under `runs/`, not a Slurm job ID | Required |
-| `--questions N` or `all` | Questions to select, subject to the update cap | `1024` |
-| `--round-size N` | Questions collected per independent round | `128` |
-| `--max-tokens N` | New-token cap per intermediate | `512` |
-| `--workers N` | Concurrent judge API calls | `8` |
-| `--config PATH` | Partial training configuration JSON | Built-in defaults or inherited configuration |
-| `--from-run NAME` | Continue from another run's latest completed round | None |
-| `--start-offset N` | Position in the deterministic dataset order | `0`, or inferred from source run |
+| `--run NAME` | Directory under `runs/`; an existing run resumes in place | Required |
+| `--gpus N` | GPUs per collection or training job (1, 2 or 4, one node) | `1` |
+| `--round-size N` | Questions per new collection round | The run's saved size, else `128` |
+| `--config PATH` | Training configuration JSON for a new run | Built-in defaults |
 | `--status` | Report saved progress and Slurm state without launching work | Off |
 
 Each round:
@@ -84,7 +78,7 @@ Each round:
 4. Randomly select at most 64 usable question rows and their accepted pairs. Perform one A/B update with `L_sys + 0.5 * L_A`; `L_A` updates only A. Reference models remain fixed at the initial base weights.
 5. Publish the checkpoint, release the training allocation, and collect the next nonoverlapping round with updated A. Unselected rows are not carried forward.
 
-Defaults are 70 cumulative updates, RMSprop at `6.4e-6`, 20 warmup steps, DPO beta `0.5`, LoRA rank/alpha `16/16`, dropout `0.05`, and seed `42`. Empty usable rounds perform no update. The pipeline stops collecting after the update cap, even with `--questions all`.
+Defaults are 70 cumulative updates, RMSprop at `6.4e-6`, 20 warmup steps, DPO beta `0.5`, LoRA rank/alpha `16/16`, dropout `0.05`, and seed `42`. Empty usable rounds perform no update. Collection walks the whole training split and stops at the update cap. Intermediate outputs are capped at 512 new tokens; judge calls run 8 at a time.
 
 Override training settings with `--config config.json`, for example:
 
@@ -92,7 +86,7 @@ Override training settings with `--config config.json`, for example:
 {"max_steps": 70, "optimizer_rows": 64, "learning_rate": 0.0000064}
 ```
 
-Prompts are in `core/prompts.json`. Use a fresh run when changing prompts or saved run settings.
+Prompts are in `core/prompts.json`. Use a fresh run when changing prompts or the training configuration.
 
 ## Status and recovery
 
@@ -105,33 +99,20 @@ sacct -j JOB_ID --format=JobID,State,ExitCode,Elapsed,AllocTRES
 
 Round artifacts are under `runs/<run>/round_<index>/`: generated questions, cached judge calls, selected training inputs, checkpoints, and component-loss metrics. Checkpoints contain A/B adapters, optimizer/scheduler state and RNG state; restoring a model also requires the saved base model. Only checkpoints with a `complete` marker are usable.
 
-Rerun the original command to reuse completed stages. Only one coordinator may operate on a run. Inspect failed jobs before removing their stage job metadata for resubmission; never resubmit an active job. Saved failed API calls require inspection, while HTTP 429 responses retry after a 30-second backoff.
-
-To branch from a completed round:
-
-```sh
-SBATCH_NTASKS=4 SBATCH_NODES=1 \
-uv run --no-sync python -u -m multi_llm.pipeline \
-  --root "$PROJECT_ROOT" --run continued --from-run train \
-  --questions all --round-size 128 --max-tokens 512 --workers 8
-```
-
-This restores adapters and optimizer/scheduler state and advances past collected questions, including unused rows. Training configuration is inherited. `--start-offset` explicitly overrides that position. Same-round checkpoint reuse requires the original worker count; it may change between completed rounds. Keep release directories while processes or submitted jobs reference them.
+Rerun the original command to resume: completed stages are reused, an interrupted round keeps its saved questions, and new rounds continue from the next unused question. `--round-size` and `--gpus` may change between reruns; only new rounds use the new size. A round interrupted mid-training must resume with its original GPU count. Only one coordinator may operate on a run. Inspect failed jobs before removing their stage job metadata for resubmission; never resubmit an active job. Saved failed API calls require inspection, while HTTP 429 responses retry after a 30-second backoff. Keep release directories while processes or submitted jobs reference them.
 
 ## Evaluate
 
 On the management node:
 
 ```sh
-uv run --no-sync python -u -m multi_llm.evaluate run \
-  --root "$PROJECT_ROOT" --run train \
-  --output "$PROJECT_ROOT/evaluations/train" \
-  --gpus 2 --max-tokens 256 --workers 8
+uv run --no-sync python -u -m multi_llm.evaluate \
+  --root "$PROJECT_ROOT" --run train --gpus 2
 ```
 
-Evaluation excludes test questions present in the training split, submits GPU generation for tuned and untuned systems, then judges tuned-versus-chosen, tuned-versus-untuned, and untuned-versus-chosen comparisons. `--gpus` accepts 1, 2 or 4 workers on one node.
+Evaluation uses the run's final checkpoint and new-token cap, writes to `evaluations/<run>/`, and excludes test questions present in the training split. It submits GPU generation for tuned and untuned systems, then judges tuned-versus-chosen, tuned-versus-untuned, and untuned-versus-chosen final answers, plus tuned-versus-untuned A drafts. `--gpus` accepts 1, 2 or 4.
 
-Outputs include the pinned manifest, generated answers, cached calls, `summary.json`, and `evaluation.ready`. Rerunning reuses saved work; changed inputs, checkpoint or settings require a new output directory.
+Outputs include the pinned manifest, generated answers, cached calls, `summary.json`, and `evaluation.ready`. Rerunning reuses saved work; to evaluate a changed checkpoint or test set, move the old `evaluations/<run>/` aside first.
 
 ## Tests
 
