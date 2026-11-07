@@ -103,7 +103,8 @@ def score_request(request: ScoringRequest, mid_model, output_model, ref_mid_mode
             "system_a_ref": system_reference_a, "b_ref": reference_b}
 
 
-def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0.5, reference_mask=None):
+def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0.5, reference_mask=None,
+                      lambda_a=LAMBDA_A):
     """Policy [N,K], reference [N,R]; auxiliary pairs index policy candidates."""
     a, b, a_ref, system_a_ref, b_ref = (scores[key] for key in ("a", "b", "a_ref", "system_a_ref", "b_ref"))
     if a.ndim != 2:
@@ -151,5 +152,5 @@ def preference_losses(scores, pairs, candidate_mask=None, beta_sys=0.5, beta_a=0
         auxiliary = losses.mean()
 
     system = system_rows.mean()
-    return {"L_sys": system, "L_A": auxiliary, "L_A_weighted": LAMBDA_A * auxiliary,
-            "L_total": system + LAMBDA_A * auxiliary}
+    return {"L_sys": system, "L_A": auxiliary, "L_A_weighted": lambda_a * auxiliary,
+            "L_total": system + lambda_a * auxiliary}

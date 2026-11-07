@@ -12,7 +12,8 @@ from core.topo_sort import topological_sort
 from core.workflow import judge_pair, model_messages, save_json
 
 
-def judge_collection(collection, workers=8):
+def judge_collection(collection, workers=8, judge_drafts=True):
+    """judge_drafts=False keeps the same scoring rows but makes no judge calls (for lambda_a=0)."""
     if workers < 1 or not (collection / "candidates.ready").exists():
         raise ValueError("Need positive concurrency and completed candidates")
 
@@ -61,6 +62,8 @@ def judge_collection(collection, workers=8):
 
             if len(set(normalized)) < 3:
                 record.discard_reason = "duplicate"
+                continue
+            if not judge_drafts:
                 continue
 
             for first, second in combinations(candidates, 2):

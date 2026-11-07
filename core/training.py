@@ -30,6 +30,10 @@ class TrainingConfig:
     alpha: int = 16
     dropout: float = 0.05
     reduction: str = "mean"
+    # False keeps B's adapter at its zero initialisation, so B stays the base model.
+    train_b: bool = True
+    # Weight of A's intermediate preference loss; 0 trains with L_sys only and skips draft judging.
+    lambda_a: float = LAMBDA_A
 
     def __post_init__(self):
         if self.max_steps < 1:
@@ -40,6 +44,8 @@ class TrainingConfig:
             raise ValueError("Invalid learning rate or warmup")
         if self.beta <= 0 or self.rank < 1 or self.alpha < 1 or not 0 <= self.dropout < 1:
             raise ValueError("Invalid DPO or adapter parameters")
+        if self.lambda_a < 0:
+            raise ValueError("lambda_a must be nonnegative")
         if self.reduction not in ("mean", "sum"):
             raise ValueError("Unknown completion reduction")
 
@@ -48,10 +54,11 @@ class TrainingConfig:
 class LossAudit:
     L_sys: float = 0.0
     L_A: float = 0.0
+    lambda_A: float = LAMBDA_A
 
     @property
     def L_A_weighted(self):
-        return LAMBDA_A * self.L_A
+        return self.lambda_A * self.L_A
 
     @property
     def L_total(self):
@@ -123,7 +130,7 @@ def backward_row(request, pairs, models, tokenizer, system_count, pair_count, co
     leaves["b"].requires_grad_()
     mask = torch.tensor([request.candidate_mask], device=leaves["a"].device)
     reference_mask = torch.tensor([request.reference_candidate_mask], device=leaves["a"].device)
-    losses = preference_losses(leaves, pairs, mask, config.beta, config.beta, reference_mask)
+    losses = preference_losses(leaves, pairs, mask, config.beta, config.beta, reference_mask, config.lambda_a)
     loss = losses["L_sys"] / system_count
     if pair_count:
         loss = loss + losses["L_A_weighted"] * len(pairs) / pair_count
@@ -136,7 +143,7 @@ def backward_row(request, pairs, models, tokenizer, system_count, pair_count, co
         for i, y in enumerate(request.intermediates):
             score = completion_logp(a, tokenizer, request.a_messages, y, config.reduction)
             score.backward(da[0, i])
-        for i, messages in enumerate(request.b_messages):
+        for i, messages in enumerate(request.b_messages if config.train_b else []):
             for j, z in enumerate(request.final_answers):
                 score = completion_logp(b, tokenizer, messages, z, config.reduction)
                 score.backward(db[0, i, j])
@@ -145,7 +152,8 @@ def backward_row(request, pairs, models, tokenizer, system_count, pair_count, co
         if final_cuda_rng is not None:
             torch.cuda.set_rng_state_all(final_cuda_rng)
     return LossAudit(L_sys=float(losses["L_sys"].detach()) / system_count,
-                     L_A=float(losses["L_A"].detach()) * len(pairs) / pair_count if pair_count else 0.0)
+                     L_A=float(losses["L_A"].detach()) * len(pairs) / pair_count if pair_count else 0.0,
+                     lambda_A=config.lambda_a)
 
 
 def copy_checkpoint(source, destination):
@@ -223,6 +231,8 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     a, b, reference, tokenizer = load_models(base, config, checkpoint, device)
+    if not config.train_b:
+        b.requires_grad_(False)
     if device == "cuda" and parallel:
         torch.cuda.manual_seed(config.seed + rank)
     parameters = [p for model in (a, b) for p in model.parameters() if p.requires_grad]
@@ -244,7 +254,7 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
     if requests:
         pair_count = sum(len(pairs[row.id]) for row in requests)
         optimizer.zero_grad(set_to_none=True)
-        audit = LossAudit()
+        audit = LossAudit(lambda_A=config.lambda_a)
         for row in requests[rank::world_size]:
             contribution = backward_row(row, pairs[row.id], (a, b, reference), tokenizer,
                                         len(requests), pair_count, config)
@@ -258,7 +268,7 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
                 dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
             combined_loss = torch.tensor([audit.L_sys, audit.L_A], device=device, dtype=torch.float64)
             dist.all_reduce(combined_loss, op=dist.ReduceOp.SUM)
-            audit = LossAudit(*combined_loss.tolist())
+            audit = LossAudit(*combined_loss.tolist(), lambda_A=config.lambda_a)
 
         loss = audit.L_total
         torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
@@ -266,7 +276,7 @@ def train_collection(base, collection, work, durable, config, resume=None, previ
         scheduler.step()
         step += 1
         record = {**asdict(audit), "L_A_weighted": audit.L_A_weighted, "L_total": loss,
-                  "lambda_A": LAMBDA_A, "step": step, "rows_done": len(requests),
+                  "step": step, "rows_done": len(requests),
                   "batch_rows": len(requests), "pairs": pair_count, "workers": world_size}
         if rank == 0:
             save_json(durable / "metrics" / f"step_{step:06d}.json", record)

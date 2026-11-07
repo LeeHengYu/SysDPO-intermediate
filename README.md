@@ -86,6 +86,8 @@ Override training settings with `--config config.json`, for example:
 {"max_steps": 70, "optimizer_rows": 64, "learning_rate": 0.0000064}
 ```
 
+Set `"lambda_a": 0` to train with `L_sys` only; collection then skips draft judging but keeps the same rows. Set `"train_b": false` to train only A: B's adapter stays at its zero initialisation, so B remains the base model while `L_sys` still scores its final answers.
+
 Prompts are in `core/prompts.json`. Use a fresh run when changing prompts or the training configuration.
 
 ## Status and recovery
@@ -110,7 +112,7 @@ uv run --no-sync python -u -m multi_llm.evaluate \
   --root "$PROJECT_ROOT" --run train --gpus 2
 ```
 
-Evaluation uses the run's final checkpoint and new-token cap, writes to `evaluations/<run>/`, and excludes test questions present in the training split. It submits GPU generation for tuned and untuned systems, then judges tuned-versus-chosen, tuned-versus-untuned, and untuned-versus-chosen final answers, plus tuned-versus-untuned A drafts. `--gpus` accepts 1, 2 or 4.
+Evaluation uses the run's final checkpoint and new-token cap, writes to `evaluations/<run>/`, and excludes test questions present in the training split. It submits GPU generation for tuned and untuned systems, then judges tuned-versus-chosen, tuned-versus-untuned, and untuned-versus-chosen final answers, plus tuned-versus-untuned A drafts. `--gpus` accepts 1, 2 or 4. `--step N` evaluates the checkpoint saved after N updates in `evaluations/<run>_step_NNN/`; `--questions N` keeps only the first N held-out questions.
 
 Outputs include the pinned manifest, generated answers, cached calls, `summary.json`, and `evaluation.ready`. Rerunning reuses saved work; to evaluate a changed checkpoint or test set, move the old `evaluations/<run>/` aside first.
 

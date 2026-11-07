@@ -48,7 +48,7 @@ class EvaluationTests(unittest.TestCase):
                     patch.dict(os.environ, {"OPENROUTER_KEY": "dummy"}):
                 run(root, "source", gpus=4)
                 run(root, "source", gpus=4)
-            prepare.assert_called_with(root, "source", output, 512)
+            prepare.assert_called_with(root, "source", output, 512, None, None)
             self.assertEqual(len(commands), 3)
             sleep.assert_called_once_with(15)
             self.assertEqual(judge.call_count, 2)
@@ -92,6 +92,10 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(manifest["training_prompt_overlap_ids"], [3])
             with self.assertRaisesRegex(ValueError, "changed"):
                 prepare_evaluation(root, "source", output, 128)
+            self.assertEqual(prepare_evaluation(root, "source", root / "step", 256, step=70, questions=1),
+                             checkpoint)
+            with self.assertRaisesRegex(ValueError, "after 5 updates"):
+                prepare_evaluation(root, "source", root / "step", 256, step=5)
             save_json(root / "data/test.json", rows)
             with self.assertRaisesRegex(ValueError, "disjoint"):
                 prepare_evaluation(root, "source", output, 256)

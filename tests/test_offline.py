@@ -102,6 +102,15 @@ class OfflineTests(unittest.TestCase):
             for name, value in {k: v.clone() for k, v in load_file(str(base / "model.safetensors")).items()}.items():
                 torch.testing.assert_close(value, original[name], atol=0, rtol=0)
 
+            frozen_config = TrainingConfig(**{**config.__dict__, "train_b": False})
+            frozen = train_collection(base, collection / "training", root / "frozen_work", root / "frozen",
+                                      frozen_config, device="cpu")
+            for role, trained in (("A", True), ("B", False)):
+                weights = {name: value.clone() for name, value in
+                           load_file(str(frozen / f"{role}_adapter" / "adapter_model.safetensors")).items()}
+                self.assertEqual(any(torch.count_nonzero(value) for name, value in weights.items()
+                                     if "lora_B" in name), trained)
+
             round_config = TrainingConfig(max_steps=3, optimizer_rows=3,
                                           warmup_steps=0, rank=2, alpha=2)
             first, second = root / "independent/round_000", root / "independent/round_001"

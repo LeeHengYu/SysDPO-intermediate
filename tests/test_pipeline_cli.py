@@ -59,7 +59,7 @@ class PipelineCliTests(unittest.TestCase):
             patch("multi_llm.pipeline.run_job", side_effect=fake_job),
             patch("multi_llm.pipeline.prepare_training"),
             patch("multi_llm.judge.judge_collection",
-                  side_effect=lambda current, workers: (current / "preferences.ready").touch()),
+                  side_effect=lambda current, workers, judge_drafts: (current / "preferences.ready").touch()),
         ):
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -146,7 +146,7 @@ class PipelineCliTests(unittest.TestCase):
         config = TrainingConfig(optimizer_rows=4, max_steps=2)
         events = []
 
-        def judge(current, workers):
+        def judge(current, workers, judge_drafts):
             selected = json.loads((current / "rows.json").read_text())
             usable = selected[1:] if current.name == "round_000" else [] if current.name == "round_001" else selected
             save_json(current / "scoring_requests.json", usable)

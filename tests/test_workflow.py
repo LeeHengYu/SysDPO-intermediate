@@ -305,6 +305,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([row.id for row in selected], [0, 1, 2])
             self.assertEqual([len(pairs[row.id]) for row in selected], [3, 0, 0])
             (root / "preferences.ready").unlink()
+            with patch("multi_llm.judge.judge_pair") as judge:
+                judge_collection(root, workers=3, judge_drafts=False)
+            judge.assert_not_called()
+            self.assertEqual(json.loads((root / "scoring_requests.json").read_text()), requests)
+            self.assertEqual(json.loads((root / "intermediate_preferences.json").read_text()), [])
+            (root / "preferences.ready").unlink()
             with patch("multi_llm.judge.judge_pair", side_effect=RuntimeError("API failed")) as judge:
                 with self.assertRaisesRegex(RuntimeError, "6 judge calls failed"):
                     judge_collection(root, workers=3)

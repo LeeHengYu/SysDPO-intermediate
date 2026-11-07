@@ -17,8 +17,8 @@ def call_judge(state, rubric, *, model="microsoft/microsoft-decision-1", criteri
     questions = {"preference": {
         "type": "choice", "instructions": rubric,
         "criteria": criteria if criteria is not None else {
-            "option1": "candidate_1 is preferable in correctness, completeness, or adherence to the task's required output format; at equal quality it is meaningfully more concise.",
-            "option2": "candidate_2 is preferable in correctness, completeness, or adherence to the task's required output format; at equal quality it is meaningfully more concise.",
+            "option1": "candidate_1 is preferable in correctness, completeness, or adherence to the task's required output format.",
+            "option2": "candidate_2 is preferable in correctness, completeness, or adherence to the task's required output format.",
         }}}
     return request_model(lambda client: client.alpha.decisions.create(
         model=model, state=state, questions=questions))

@@ -135,7 +135,7 @@ def pipeline(root, run, config=None, round_size=None, gpus=1):
 
             run_job("collect", root, current, previous, manifest["max_tokens"], gpus)
             if not (current / "preferences.ready").exists():
-                judge_collection(current, JUDGE_WORKERS)
+                judge_collection(current, JUDGE_WORKERS, config.lambda_a > 0)
 
             prepare_training(current, config)
             run_job("train", root, current, previous, manifest["max_tokens"], gpus)

@@ -35,7 +35,16 @@ COMPARISONS = {"trained_vs_chosen": ("trained", "chosen", "z"),
                "trained_a_vs_prompted_a": ("trained", "prompted", "y")}
 
 
-def prepare_evaluation(root, run, output, max_tokens):
+def step_checkpoint(rounds, step):
+    """Return the complete checkpoint saved after `step` optimizer updates."""
+    for path in sorted(path.parent for directory in rounds
+                       for path in directory.glob("checkpoints/rows_*/complete")):
+        if json.loads((path / "state.json").read_text())["optimizer_steps"] == step:
+            return path
+    raise ValueError(f"No complete checkpoint after {step} updates")
+
+
+def prepare_evaluation(root, run, output, max_tokens, step=None, questions=None):
     from multi_llm.runs import latest_checkpoint, run_directory
 
     if max_tokens < 1:
@@ -45,7 +54,7 @@ def prepare_evaluation(root, run, output, max_tokens):
     rounds = sorted(source.glob("round_[0-9][0-9][0-9]"))
     if not rounds or not (rounds[-1] / "training.ready").exists():
         raise ValueError("Source run has not completed its final round")
-    checkpoint = latest_checkpoint(rounds[-1])
+    checkpoint = latest_checkpoint(rounds[-1]) if step is None else step_checkpoint(rounds, step)
     if checkpoint is None:
         raise ValueError("No complete final checkpoint")
 
@@ -63,6 +72,8 @@ def prepare_evaluation(root, run, output, max_tokens):
     test = [row for row in test if row["id"] not in excluded]
     if not test:
         raise ValueError("No held-out questions remain after deduplication")
+    # The test split is already shuffled, so a prefix is a random subset.
+    test = test[:questions]
     test_ids = [row["id"] for row in test]
 
     config = json.loads((rounds[-1] / "collection_config.json").read_text())
@@ -243,8 +254,8 @@ def judge(directory, workers=8):
     (directory / "evaluation.ready").write_text("complete\n")
 
 
-def run(root, run, gpus=1):
-    """Evaluate a run's final checkpoint in evaluations/<run>, reusing saved generations and judgments."""
+def run(root, run, gpus=1, step=None, questions=None):
+    """Evaluate a run's final (or `step`) checkpoint, reusing saved generations and judgments."""
     import fcntl
     from multi_llm.pipeline import GPU_CHOICES, JUDGE_WORKERS, read_manifest, wait_job
     from multi_llm.runs import run_directory
@@ -254,11 +265,13 @@ def run(root, run, gpus=1):
     root = root.resolve()
     # Generate with the same new-token cap the run trained with.
     max_tokens = read_manifest(run_directory(root, run) / "experiment.json")["max_tokens"]
-    output = root / "evaluations" / run
+    if questions is not None and questions < 1:
+        raise ValueError("questions must be positive")
+    output = root / "evaluations" / (run if step is None else f"{run}_step_{step:03d}")
     output.mkdir(parents=True, exist_ok=True)
     with (output / "coordinator.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        checkpoint = prepare_evaluation(root, run, output, max_tokens)
+        checkpoint = prepare_evaluation(root, run, output, max_tokens, step, questions)
         job_path = output / "generate_job.json"
         if not (output / "generation.ready").exists():
             if job_path.exists():
@@ -298,6 +311,8 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", required=True, help="Run under runs/; output goes to evaluations/<run>")
     parser.add_argument("--gpus", type=int, choices=GPU_CHOICES, default=1, help="GPUs for generation")
+    parser.add_argument("--step", type=int, help="Evaluate the checkpoint after this many updates")
+    parser.add_argument("--questions", type=int, help="Evaluate only the first N held-out questions")
     run(**vars(parser.parse_args(argv)))
 
 

@@ -358,6 +358,8 @@ class LikelihoodChecks(unittest.TestCase):
         empty = preference_losses(scores, [])
         self.assertEqual(empty["L_A"].item(), 0)
         self.assertEqual(empty["L_A_weighted"].item(), 0)
+        unweighted = preference_losses(scores, [(0, 0, 1), (1, 1, 0)], lambda_a=0)
+        self.assertEqual(unweighted["L_total"].item(), unweighted["L_sys"].item())
         with self.assertRaises(ValueError):
             preference_losses(scores, [(0, 0, 0)])
 
